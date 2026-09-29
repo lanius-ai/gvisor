@@ -713,8 +713,8 @@ TEST_F(TuntapTest, WriteHangBug155928773) {
   const auto tuntap = ASSERT_NO_ERRNO_AND_VALUE(OpenAndAttachTunTap(
       kTapName, kTapIPAddr, true /* tap */, false /* no_pi */));
 
-  int sock = socket(AF_INET, SOCK_DGRAM, 0);
-  ASSERT_THAT(sock, SyscallSucceeds());
+  FileDescriptor sock =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_INET, SOCK_DGRAM, 0));
 
   struct sockaddr_in remote = {
       .sin_family = AF_INET,
@@ -722,8 +722,8 @@ TEST_F(TuntapTest, WriteHangBug155928773) {
       .sin_addr = {.s_addr = kTapIPAddr},
   };
   // Return values do not matter in this test.
-  connect(sock, AsSockAddr(&remote), sizeof(remote));
-  write(sock, "hello", 5);
+  connect(sock.get(), AsSockAddr(&remote), sizeof(remote));
+  write(sock.get(), "hello", 5);
 }
 
 // Test that raw packet sockets do not need/include link headers when
