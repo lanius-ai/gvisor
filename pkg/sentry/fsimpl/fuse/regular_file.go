@@ -140,10 +140,14 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	inode.attrMu.Lock()
 	defer inode.attrMu.Unlock()
 
-	// Reading beyond EOF, update file size if outdated.
+	// Reading beyond EOF, update file size if outdated. As in Linux's
+	// fuse_file_read_iter() => fuse_update_attributes(), only ask the server
+	// once the cached attributes have expired (attr_valid).
 	if uint64(offset+size) > inode.size.Load() {
-		if err := inode.reviseAttr(ctx, linux.FUSE_GETATTR_FH, fd.Fh); err != nil {
-			return 0, err
+		if inode.fs.clock.Now().After(inode.attrTime) {
+			if err := inode.reviseAttr(ctx, linux.FUSE_GETATTR_FH, fd.Fh); err != nil {
+				return 0, err
+			}
 		}
 		// If the offset after update is still too large, return error.
 		if uint64(offset) >= inode.size.Load() {
