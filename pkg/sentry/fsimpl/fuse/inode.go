@@ -280,13 +280,17 @@ func (i *inode) getFUSEAttr() linux.FUSEAttr {
 // statFromFUSEAttr makes attributes from linux.FUSEAttr to linux.Statx.
 func statFromFUSEAttr(attr linux.FUSEAttr, mask, devMinor uint32) linux.Statx {
 	var stat linux.Statx
+	// Every basic field is filled from attr, so report all requested basic
+	// fields as valid, as Linux's fuse_fillattr() does. VFS relies on this:
+	// execve() requires STATX_TYPE in the result mask.
+	stat.Mask = mask & linux.STATX_BASIC_STATS
 	stat.Blksize = attr.BlkSize
 	stat.DevMajor, stat.DevMinor = linux.UNNAMED_MAJOR, devMinor
 
 	rdevMajor, rdevMinor := linux.DecodeDeviceID(attr.Rdev)
 	stat.RdevMajor, stat.RdevMinor = uint32(rdevMajor), rdevMinor
 
-	if mask&linux.STATX_MODE != 0 {
+	if mask&(linux.STATX_TYPE|linux.STATX_MODE) != 0 {
 		stat.Mode = uint16(attr.Mode)
 	}
 	if mask&linux.STATX_NLINK != 0 {
