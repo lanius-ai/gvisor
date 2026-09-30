@@ -82,5 +82,5 @@ jobs:
           date=$(date -u +%Y%m%d); tag="craypot-$date-${GITHUB_SHA::9}"
           if gh release view "$tag" >/dev/null 2>&1; then echo "$tag exists"; exit 0; fi
           gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" \
-            --notes "runsc $(cat version), x86_64, nightly layout. sha256 $(cut -d' ' -f1 gvisor.tar.zstd.sha256). GCS: gs://lanius-craypot-gvisor-assets/gvisor/fusefork/$date/x86_64/gvisor.tar.zstd" \
+            --notes "runsc $(cat version), x86_64, nightly layout. sha256 $(cut -d' ' -f1 gvisor.tar.zstd.sha256). GCS: gs://lanius-craypot-gvisor-assets/gvisor/fusefork/${tag#craypot-}/x86_64/gvisor.tar.zstd" \
             gvisor.tar.zstd gvisor.tar.zstd.sha256
