@@ -2,7 +2,7 @@
 # In-sandbox FUSE workload. Usage: work.sh <mode> where mode is
 #   bindfs     bindfs /srv/b -> /w (libfuse, no kernel_cache => no FOPEN_KEEP_CACHE)
 #   bindfs-kc  same with -o kernel_cache (FOPEN_KEEP_CACHE)
-#   agentfs    agentfs v0.6.4 mount at /w
+#   agentfs    AgentFS mount at /w
 #   rootfs     plain directory /w (baseline)
 # Prints "RESULT <name> PASS|FAIL [detail]" lines.
 MODE=$1; W=/w; B=

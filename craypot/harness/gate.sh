@@ -17,9 +17,6 @@ B=$(realpath "$1"); H=$(realpath -m "$2"); T=$(cd "$(dirname "$0")" && pwd)
 IMG=${IMG:-craypot-gvisor-harness}
 OUTER=debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 STRESS_SECS=${STRESS_SECS:-60}
-# AgentFS v0.6.4 answers READ on an unlinked-open inode with 0 bytes (server
-# bug, fixed in lanius-ai/agentfs); an unexpected pass is reported, not failed.
-XFAIL=" agentfs:mm.read_unlinked_open agentfs:mm.mmap_unlinked_open "
 # RESULT lines each run must print; fewer means it died part way.
 declare -A EXPECT=([agentfs]=39 [bindfs]=41 [bindfs-kc]=41 [stress]=1 [cr]=12)
 R="/b/runsc --root /tmp/runsc --platform=systrap --overlay2=root:self --network=none --ignore-cgroups"
@@ -98,10 +95,6 @@ for run in "${!EXPECT[@]}"; do
   n=$(grep -c '^RESULT ' "$f" 2>/dev/null); n=${n:-0}
   [ "$n" -ge "${EXPECT[$run]}" ] || { echo "GATE $run: $n of ${EXPECT[$run]} results"; bad=1; }
   while read -r _ name st rest; do
-    name=${name%:}
-    case "$XFAIL" in
-    *" $run:$name "*) [ "$st" = PASS ] && echo "XPASS $run:$name (drop it from XFAIL)"; continue ;;
-    esac
     [ "$st" = PASS ] || { echo "GATE $run: $name $st $rest"; bad=1; }
   done < <(grep '^RESULT ' "$f" 2>/dev/null)
 done
