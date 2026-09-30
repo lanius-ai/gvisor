@@ -16,6 +16,7 @@
 package memmap
 
 import (
+	"errors"
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/context"
@@ -74,7 +75,8 @@ type Mappable interface {
 	// of offsets specified by required, and at most the range of offsets
 	// specified by optional. at is the set of access types that may be
 	// performed using the returned Translations. If not all required offsets
-	// are translated, it returns a non-nil error explaining why.
+	// are translated, it returns a non-nil error explaining why. Mappables
+	// that implement Filler may return ErrFill.
 	//
 	// Translations are valid until invalidated by a callback to
 	// MappingSpace.Invalidate or until the caller removes its mapping of the
@@ -100,6 +102,34 @@ type Mappable interface {
 	// Invariant: InvalidateUnsavable never races with concurrent calls to any
 	// other Mappable methods.
 	InvalidateUnsavable(ctx context.Context) error
+}
+
+// ErrFill is returned by Mappable.Translate, instead of blocking, when
+// translating the rest of the required range needs I/O that must not be done
+// with mm locks held. Only Mappables that implement Filler may return it. The
+// caller releases its mm locks, calls Filler.Fill and retries Translate.
+var ErrFill = errors.New("translation requires Filler.Fill")
+
+// Filler is implemented by Mappables whose Translate returns ErrFill instead
+// of blocking on I/O that may wait for other tasks. For example, a FUSE
+// server is a task in the same sandbox, and its syscalls take
+// kernel.TaskSet.mu, which precedes mm.MemoryManager.activeMu (held during
+// Translate) in the lock order.
+type Filler interface {
+	// Fill does the I/O that Translate(required, optional, at) returned
+	// ErrFill for, e.g. by caching the contents of required; it may also
+	// cache parts of optional. Translate may return ErrFill again if the data
+	// was dropped before the retry, so callers bound their retries.
+	//
+	// Fill is called without mm locks held and may block.
+	//
+	// Preconditions:
+	//	* required and optional are as passed to the Translate call that
+	//		returned ErrFill, less the translated prefix of required.
+	//	* The caller holds a reference on the MappingIdentity of the mapping
+	//		passed to that Translate call. The mapping itself may have been
+	//		removed since.
+	Fill(ctx context.Context, required, optional MappableRange, at hostarch.AccessType) error
 }
 
 // Translations are returned by Mappable.Translate.

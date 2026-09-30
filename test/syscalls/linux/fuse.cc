@@ -15,16 +15,24 @@
 #include <fcntl.h>
 #include <linux/capability.h>
 #include <linux/fuse.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -32,12 +40,19 @@
 #include "gtest/gtest.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
+#include "test/util/memory_util.h"
 #include "test/util/mount_util.h"
+#include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
+#include "test/util/signal_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -219,6 +234,215 @@ TEST(FuseTest, LookupUpdatesInode) {
 
   EXPECT_THAT(access(path.path().c_str(), O_RDONLY),
               SyscallFailsWithErrno(ENOENT));
+}
+
+// Unmounting aborts the connection, so that the server learns that the
+// filesystem is gone (Linux: fuse_sb_destroy() => fuse_abort_conn()).
+TEST(FuseTest, UnmountAbortsConnection) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/fuse", O_RDWR));
+
+  auto mount_point = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto mount_opts =
+      absl::StrFormat("fd=%d,user_id=0,group_id=0,rootmode=40000", fd.get());
+  ASSERT_THAT(mount("fuse", mount_point.path().c_str(), "fuse",
+                    MS_NODEV | MS_NOSUID, mount_opts.c_str()),
+              SyscallSucceeds());
+  FuseInit(fd.get());
+  ASSERT_THAT(umount(mount_point.path().c_str()), SyscallSucceeds());
+
+  struct pollfd pfd = {.fd = fd.get(), .events = POLLIN};
+  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, 10000), SyscallSucceedsWithValue(1));
+  alignas(fuse_in_header) char req_buf[FUSE_MIN_READ_BUFFER];
+  EXPECT_THAT(read(fd.get(), req_buf, sizeof(req_buf)),
+              SyscallFailsWithErrno(ENODEV));
+}
+
+// execve() of a script requires the file type in the statx mask.
+TEST(FuseTest, StatxAndExecScript) {
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), "#!/bin/sh\nexit 7\n", 0755));
+
+  struct statx stx;
+  ASSERT_THAT(syscall(SYS_statx, AT_FDCWD, script.path().c_str(), 0,
+                      STATX_BASIC_STATS, &stx),
+              SyscallSucceeds());
+  EXPECT_EQ(stx.stx_mask & STATX_BASIC_STATS, STATX_BASIC_STATS);
+  EXPECT_TRUE(S_ISREG(stx.stx_mode));
+
+  pid_t child;
+  int execve_errno;
+  auto kill = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, &child, &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  kill.Release();
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 7) << status;
+}
+
+// Pages of a large shared mapping are read on fault, including pages far
+// apart and holes.
+TEST(FuseTest, MmapLargeSparseFile) {
+  constexpr size_t kSize = 256 << 20;
+  constexpr size_t kStride = 1 << 20;
+  TempPath path =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(GetAbsoluteTestTmpdir()));
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path.path(), O_RDWR));
+  ASSERT_THAT(ftruncate(fd.get(), kSize), SyscallSucceeds());
+  for (size_t off = 0; off < kSize; off += kStride) {
+    const char c = 'a' + (off / kStride) % 26;
+    ASSERT_THAT(pwrite(fd.get(), &c, 1, off + kStride / 2),
+                SyscallSucceedsWithValue(1));
+  }
+
+  Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      Mmap(nullptr, kSize, PROT_READ, MAP_SHARED, fd.get(), 0));
+  const char* p = reinterpret_cast<const char*>(m.ptr());
+  for (size_t off = 0; off < kSize; off += kStride) {
+    EXPECT_EQ(p[off + kStride / 2], 'a' + (off / kStride) % 26) << off;
+    EXPECT_EQ(p[off + kStride / 2 + 1], 0) << off;
+    EXPECT_EQ(p[off], 0) << off;
+  }
+
+  // A later write(2) is visible through the mapping.
+  const char c = 'Z';
+  ASSERT_THAT(pwrite(fd.get(), &c, 1, kSize - 1), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(p[kSize - 1], 'Z');
+}
+
+// A signal that interrupts a page fault waiting for the server is handled and
+// the fault is retried, instead of raising SIGBUS.
+TEST(FuseTest, MmapFaultInterruptedBySignal) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  // The server thread must not be paused by a save.
+  const DisableSave ds;
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/fuse", O_RDWR));
+  auto mount_point = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto mount_opts =
+      absl::StrFormat("fd=%d,user_id=0,group_id=0,rootmode=40755", fd.get());
+  ASSERT_THAT(mount("fuse", mount_point.path().c_str(), "fuse",
+                    MS_NODEV | MS_NOSUID, mount_opts.c_str()),
+              SyscallSucceeds());
+  FuseInit(fd.get());
+
+  constexpr uint64_t kFileNode = 2;
+  const size_t kFileSize = kPageSize;
+  absl::Notification first_read, release_first_read;
+  ScopedThread server([&] {
+    auto fill_attr = [&](uint64_t nodeid, fuse_attr* attr) {
+      attr->ino = nodeid;
+      attr->nlink = 1;
+      if (nodeid == FUSE_ROOT_ID) {
+        attr->mode = S_IFDIR | 0755;
+      } else {
+        attr->mode = S_IFREG | 0644;
+        attr->size = kFileSize;
+      }
+    };
+    int reads = 0;
+    std::vector<char> req(FUSE_MIN_READ_BUFFER + kPageSize);
+    std::vector<char> resp(sizeof(fuse_out_header) + kPageSize);
+    for (;;) {
+      ssize_t n = read(fd.get(), req.data(), req.size());
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n < 0) {
+        return;  // ENODEV after umount.
+      }
+      auto* in = reinterpret_cast<fuse_in_header*>(req.data());
+      void* in_payload = in + 1;
+      auto* out = reinterpret_cast<fuse_out_header*>(resp.data());
+      void* out_payload = out + 1;
+      memset(resp.data(), 0, resp.size());
+      out->unique = in->unique;
+      size_t len = 0;
+      switch (in->opcode) {
+        case FUSE_LOOKUP: {
+          auto* entry = reinterpret_cast<fuse_entry_out*>(out_payload);
+          entry->nodeid = kFileNode;
+          entry->entry_valid = entry->attr_valid = 3600;
+          fill_attr(kFileNode, &entry->attr);
+          len = sizeof(*entry);
+          break;
+        }
+        case FUSE_GETATTR: {
+          auto* attr = reinterpret_cast<fuse_attr_out*>(out_payload);
+          attr->attr_valid = 3600;
+          fill_attr(in->nodeid, &attr->attr);
+          len = sizeof(*attr);
+          break;
+        }
+        case FUSE_OPEN: {
+          auto* open = reinterpret_cast<fuse_open_out*>(out_payload);
+          open->fh = 1;
+          open->open_flags = FOPEN_KEEP_CACHE;
+          len = sizeof(*open);
+          break;
+        }
+        case FUSE_READ: {
+          if (reads++ == 0) {
+            first_read.Notify();
+            release_first_read.WaitForNotification();
+          }
+          auto* read_in = reinterpret_cast<fuse_read_in*>(in_payload);
+          len = read_in->offset < kFileSize
+                    ? std::min<size_t>(read_in->size,
+                                       kFileSize - read_in->offset)
+                    : 0;
+          memset(out_payload, 'x', len);
+          break;
+        }
+        case FUSE_ACCESS:
+        case FUSE_FLUSH:
+        case FUSE_RELEASE:
+          break;
+        case FUSE_INTERRUPT:
+        case FUSE_FORGET:
+        case FUSE_BATCH_FORGET:
+          continue;  // No reply.
+        default:
+          out->error = -ENOSYS;
+      }
+      out->len = sizeof(*out) + len;
+      // The reply to an interrupted request may be refused.
+      write(fd.get(), resp.data(), out->len);
+    }
+  });
+  // Stops the server, also if an assertion fails.
+  Cleanup unmount([&] { umount(mount_point.path().c_str()); });
+
+  static std::atomic<int> signals;
+  signals = 0;
+  struct sigaction sa = {};
+  sa.sa_handler = +[](int) { signals++; };
+  auto cleanup_sigaction =
+      ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(SIGUSR1, sa));
+  {
+    const FileDescriptor file = ASSERT_NO_ERRNO_AND_VALUE(
+        Open(JoinPath(mount_point.path(), "file"), O_RDONLY));
+    Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+        Mmap(nullptr, kFileSize, PROT_READ, MAP_SHARED, file.get(), 0));
+    std::atomic<pid_t> tid{0};
+    std::atomic<char> got{0};
+    ScopedThread faulter([&] {
+      tid = syscall(SYS_gettid);
+      got = *reinterpret_cast<volatile char*>(m.ptr());
+    });
+    first_read.WaitForNotification();
+    ASSERT_THAT(syscall(SYS_tgkill, getpid(), tid.load(), SIGUSR1),
+                SyscallSucceeds());
+    // Give the signal time to arrive while the read is pending.
+    absl::SleepFor(absl::Milliseconds(100));
+    release_first_read.Notify();
+    faulter.Join();
+    EXPECT_EQ(got, 'x');
+    EXPECT_EQ(signals, 1);
+  }
 }
 
 }  // namespace

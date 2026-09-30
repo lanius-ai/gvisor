@@ -108,6 +108,15 @@ func translateIOError(ctx context.Context, err error) error {
 	return linuxerr.EFAULT
 }
 
+// translateFillError is translateIOError for errors from fillAndUnlock, which
+// keeps interruptions so that the syscall can be restarted.
+func translateFillError(ctx context.Context, err error) error {
+	if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+		return err
+	}
+	return translateIOError(ctx, err)
+}
+
 // CopyOut implements usermem.IO.CopyOut.
 func (mm *MemoryManager) CopyOut(ctx context.Context, addr hostarch.Addr, src []byte, opts usermem.IOOpts) (int, error) {
 	ar, ok := mm.CheckIORange(addr, int64(len(src)))
@@ -520,6 +529,8 @@ func (mm *MemoryManager) LoadUint32(ctx context.Context, addr hostarch.Addr, opt
 //   - ioar.Length() != 0.
 //   - ioar.Contains(addr).
 func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr, ioar hostarch.AddrRange, at hostarch.AccessType) error {
+	var fills fillRetries
+retry:
 	// Try to map all remaining pages in the I/O operation. This RoundUp can't
 	// overflow because otherwise it would have been caught by CheckIORange.
 	end, _ := ioar.End.RoundUp()
@@ -544,6 +555,12 @@ func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr
 	// Ensure that we have usable pmas.
 	mm.activeMu.Lock()
 	pseg, pend, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
+	if fr := fillRequestOf(err); fr != nil && fills.more(uint64(pend.Start())) {
+		if err := mm.fillAndUnlock(ctx, fr); err != nil {
+			return translateFillError(ctx, err)
+		}
+		goto retry
+	}
 	mm.mappingMu.RUnlock()
 	if pendaddr := pend.Start(); pendaddr < ar.End {
 		if pendaddr <= ar.Start {
@@ -584,6 +601,10 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 	}
 	mm.activeMu.RUnlock()
 
+	var fills fillRetries
+	origAR := ar
+retry:
+	ar = origAR
 	// Ensure that we have usable vmas.
 	mm.mappingMu.RLock()
 	vseg, vend, verr := mm.getVMAsLocked(ctx, ar, at, ignorePermissions)
@@ -598,6 +619,13 @@ func (mm *MemoryManager) withInternalMappings(ctx context.Context, ar hostarch.A
 	// Ensure that we have usable pmas.
 	mm.activeMu.Lock()
 	pseg, pend, perr := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
+	if fr := fillRequestOf(perr); fr != nil && fills.more(uint64(pend.Start())) {
+		// Fill before doing any I/O, so that it isn't cut short.
+		if err := mm.fillAndUnlock(ctx, fr); err != nil {
+			return 0, translateFillError(ctx, err)
+		}
+		goto retry
+	}
 	mm.mappingMu.RUnlock()
 	if pendaddr := pend.Start(); pendaddr < ar.End {
 		if pendaddr <= ar.Start {
@@ -660,6 +688,8 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	}
 	mm.activeMu.RUnlock()
 
+	var fills fillRetries
+retry:
 	// Ensure that we have usable vmas.
 	mm.mappingMu.RLock()
 	vars, verr := mm.getVecVMAsLocked(ctx, ars, at, ignorePermissions)
@@ -671,6 +701,12 @@ func (mm *MemoryManager) withVecInternalMappings(ctx context.Context, ars hostar
 	// Ensure that we have usable pmas.
 	mm.activeMu.Lock()
 	pars, perr := mm.getVecPMAsLocked(ctx, vars, at, true /* callerIndirectCommit */)
+	if fr := fillRequestOf(perr); fr != nil && fills.more(uint64(pars.NumBytes())) {
+		if err := mm.fillAndUnlock(ctx, fr); err != nil {
+			return 0, translateFillError(ctx, err)
+		}
+		goto retry
+	}
 	mm.mappingMu.RUnlock()
 	if pars.NumBytes() == 0 {
 		mm.activeMu.Unlock()

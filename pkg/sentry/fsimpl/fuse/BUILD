@@ -1,3 +1,4 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
@@ -53,6 +54,34 @@ go_template_instance(
     },
 )
 
+declare_mutex(
+    name = "inode_attr_mutex",
+    out = "inode_attr_mutex.go",
+    package = "fuse",
+    prefix = "inodeAttr",
+)
+
+declare_mutex(
+    name = "inode_data_mutex",
+    out = "inode_data_mutex.go",
+    package = "fuse",
+    prefix = "inodeData",
+)
+
+declare_mutex(
+    name = "inode_io_mutex",
+    out = "inode_io_mutex.go",
+    package = "fuse",
+    prefix = "inodeIO",
+)
+
+declare_mutex(
+    name = "inode_maps_mutex",
+    out = "inode_maps_mutex.go",
+    package = "fuse",
+    prefix = "inodeMaps",
+)
+
 go_library(
     name = "fuse",
     srcs = [
@@ -65,7 +94,11 @@ go_library(
         "fusefs.go",
         "host_connection.go",
         "inode.go",
+        "inode_attr_mutex.go",
         "inode_connection.go",
+        "inode_data_mutex.go",
+        "inode_io_mutex.go",
+        "inode_maps_mutex.go",
         "inode_refs.go",
         "read_write.go",
         "register.go",
@@ -101,6 +134,7 @@ go_library(
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/vfs",
         "//pkg/sync",
+        "//pkg/sync/locking",
         "//pkg/syserr",
         "//pkg/usermem",
         "//pkg/waiter",

@@ -45,6 +45,8 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	// Ensure that we have a usable vma. Here and below, since we are only
 	// asking for a single page, there is no possibility of partial success,
 	// and any error is immediately fatal.
+	var fills fillRetries
+retry:
 	mm.mappingMu.RLock()
 	vseg, _, err := mm.getVMAsLocked(ctx, ar, at, false)
 	if err != nil {
@@ -55,6 +57,17 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	// Ensure that we have a usable pma.
 	mm.activeMu.Lock()
 	pseg, _, err := mm.getPMAsLocked(ctx, vseg, ar, at, true /* callerIndirectCommit */, false /* forPin */)
+	if fr := fillRequestOf(err); fr != nil && fills.more(0) {
+		if err := mm.fillAndUnlock(ctx, fr); err != nil {
+			if linuxerr.Equals(linuxerr.ErrInterrupted, err) {
+				// Handle the signal, then fault again.
+				return nil
+			}
+			// Linux: a failed readpage gives VM_FAULT_SIGBUS.
+			return &memmap.BusError{Err: err}
+		}
+		goto retry
+	}
 	mm.mappingMu.RUnlock()
 	if err != nil {
 		mm.activeMu.Unlock()
@@ -919,7 +932,11 @@ func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length u
 				return linuxerr.ENOMEM
 			}
 			_, _, err := mm.getPMAsLocked(ctx, vseg, vseg.Range().Intersect(ar), hostarch.NoAccess, true /* callerIndirectCommit */, false /* forPin */)
-			if err != nil {
+			// ponytail: pages that need memmap.Filler.Fill are not locked
+			// in eagerly but faulted in on use, like MAP_POPULATE failures
+			// (populateVMAAndUnlock); filling here would need a restartable
+			// loop.
+			if err != nil && fillRequestOf(err) == nil {
 				mm.activeMu.Unlock()
 				mm.mappingMu.RUnlock()
 				// Linux: mm/mlock.c:__mlock_posix_error_return()

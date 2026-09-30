@@ -16,7 +16,10 @@ package mm
 
 import (
 	"bytes"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -28,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -580,5 +584,206 @@ func TestMRemapMappableOffsetOverflow(t *testing.T) {
 	// We remap with oldSize = PageSize, newSize = 3*PageSize.
 	if _, err := mm.MRemap(ctx, addr, hostarch.PageSize, 3*hostarch.PageSize, MRemapOpts{}); !linuxerr.Equals(linuxerr.EINVAL, err) {
 		t.Errorf("MRemap grow got err %v want EINVAL", err)
+	}
+}
+
+// fillMappable is a memmap.Mappable, memmap.Filler and memmap.MappingIdentity
+// over pages of a MemoryFile, whose Translate returns memmap.ErrFill for pages
+// that Fill hasn't filled yet.
+type fillMappable struct {
+	t  *testing.T
+	mm *MemoryManager
+	mf *pgalloc.MemoryFile
+	fr memmap.FileRange
+
+	refs atomic.Int64
+
+	mu sync.Mutex
+	// fillPages is the number of missing pages that each Fill fills.
+	fillPages int
+	// fillErr is returned by Fill.
+	fillErr error
+	filled  []bool
+	fills   int
+}
+
+// newFillMapping maps a fillMappable of pages pages, where page i holds byte
+// i+1, shared and readable.
+func newFillMapping(ctx context.Context, t *testing.T, mm *MemoryManager, pages int) (*fillMappable, hostarch.Addr) {
+	mf := pgalloc.MemoryFileFromContext(ctx)
+	buf := make([]byte, pages*hostarch.PageSize)
+	for i := range buf {
+		buf[i] = byte(i/hostarch.PageSize + 1)
+	}
+	reader := safemem.BlockSeqReader{Blocks: safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf))}
+	fr, err := mf.Allocate(uint64(len(buf)), pgalloc.AllocOpts{
+		Kind:       usage.Anonymous,
+		Mode:       pgalloc.AllocateAndWritePopulate,
+		ReaderFunc: reader.ReadToBlocks,
+	})
+	if err != nil {
+		t.Fatalf("Allocate failed: %v", err)
+	}
+	t.Cleanup(func() { mf.DecRef(fr) })
+	m := &fillMappable{t: t, mm: mm, mf: mf, fr: fr, filled: make([]bool, pages)}
+	addr, err := mm.MMap(ctx, memmap.MMapOpts{
+		Length:          uint64(len(buf)),
+		MappingIdentity: m,
+		Mappable:        m,
+		Perms:           hostarch.Read,
+		MaxPerms:        hostarch.AnyAccess,
+	})
+	if err != nil {
+		t.Fatalf("MMap failed: %v", err)
+	}
+	return m, addr
+}
+
+func (m *fillMappable) IncRef()                    { m.refs.Add(1) }
+func (m *fillMappable) DecRef(ctx context.Context) { m.refs.Add(-1) }
+func (m *fillMappable) MappedName(ctx context.Context) string {
+	return "fill"
+}
+func (m *fillMappable) DeviceID() uint64 { return 0 }
+func (m *fillMappable) InodeID() uint64  { return 0 }
+func (m *fillMappable) Msync(ctx context.Context, mr memmap.MappableRange) error {
+	return nil
+}
+func (m *fillMappable) AddMapping(context.Context, memmap.MappingSpace, hostarch.AddrRange, uint64, bool) error {
+	return nil
+}
+func (m *fillMappable) RemoveMapping(context.Context, memmap.MappingSpace, hostarch.AddrRange, uint64, bool) {
+}
+func (m *fillMappable) CopyMapping(context.Context, memmap.MappingSpace, hostarch.AddrRange, hostarch.AddrRange, uint64, bool) error {
+	return nil
+}
+func (m *fillMappable) InvalidateUnsavable(context.Context) error { return nil }
+
+// Translate implements memmap.Mappable.Translate.
+func (m *fillMappable) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var ts []memmap.Translation
+	for off := required.Start; off < required.End; off += hostarch.PageSize {
+		if !m.filled[off/hostarch.PageSize] {
+			return ts, memmap.ErrFill
+		}
+		ts = append(ts, memmap.Translation{
+			Source: memmap.MappableRange{Start: off, End: off + hostarch.PageSize},
+			File:   m.mf,
+			Offset: m.fr.Start + off,
+			Perms:  hostarch.AnyAccess,
+		})
+	}
+	return ts, nil
+}
+
+// Fill implements memmap.Filler.Fill.
+func (m *fillMappable) Fill(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) error {
+	// Fill may block on tasks that need the mm's locks.
+	locked := make(chan struct{})
+	go func() {
+		m.mm.mappingMu.Lock()
+		m.mm.activeMu.Lock()
+		m.mm.activeMu.Unlock()
+		m.mm.mappingMu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(10 * time.Second):
+		m.t.Errorf("Fill(%v) called with mm locks held", required)
+	}
+	if m.refs.Load() < 2 {
+		m.t.Errorf("Fill(%v) called without a MappingIdentity reference: refs %d", required, m.refs.Load())
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fills++
+	n := m.fillPages
+	for off := required.Start; off < required.End && n > 0; off += hostarch.PageSize {
+		if i := off / hostarch.PageSize; !m.filled[i] {
+			m.filled[i] = true
+			n--
+		}
+	}
+	return m.fillErr
+}
+
+func TestCopyInFillsMappable(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		prefilled int
+		fillPages int
+		wantFills int
+	}{
+		{name: "one fill", fillPages: 8, wantFills: 1},
+		// Translations for the filled prefix must not cut the copy short.
+		{name: "half filled", prefilled: 4, fillPages: 8, wantFills: 1},
+		// Fills that each make progress aren't bounded by maxFillRetries.
+		{name: "page per fill", fillPages: 1, wantFills: 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			mm := testMemoryManager(ctx, t)
+			defer mm.DecUsers(ctx)
+			m, addr := newFillMapping(ctx, t, mm, 8)
+			for i := 0; i < test.prefilled; i++ {
+				m.filled[i] = true
+			}
+			m.fillPages = test.fillPages
+
+			buf := make([]byte, 8*hostarch.PageSize)
+			n, err := mm.CopyIn(ctx, addr, buf, usermem.IOOpts{})
+			if err != nil || n != len(buf) {
+				t.Fatalf("CopyIn got (%d, %v) want (%d, nil)", n, err, len(buf))
+			}
+			for i, b := range buf {
+				if want := byte(i/hostarch.PageSize + 1); b != want {
+					t.Fatalf("byte %d got %d want %d", i, b, want)
+				}
+			}
+			if m.fills != test.wantFills {
+				t.Errorf("got %d fills want %d", m.fills, test.wantFills)
+			}
+			if got := m.refs.Load(); got != 1 {
+				t.Errorf("MappingIdentity refs got %d want 1 (the vma's)", got)
+			}
+		})
+	}
+}
+
+func TestCopyInFillFails(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		fillPages int
+		fillErr   error
+		wantErr   error
+		wantFills int
+	}{
+		{name: "no progress", wantErr: linuxerr.EFAULT, wantFills: maxFillRetries},
+		{name: "server error", fillErr: linuxerr.EIO, wantErr: linuxerr.EFAULT, wantFills: 1},
+		// The syscall is restarted after the signal is handled.
+		{name: "interrupted", fillErr: linuxerr.ErrInterrupted, wantErr: linuxerr.ErrInterrupted, wantFills: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := contexttest.Context(t)
+			mm := testMemoryManager(ctx, t)
+			defer mm.DecUsers(ctx)
+			m, addr := newFillMapping(ctx, t, mm, 1)
+			m.fillErr = test.fillErr
+
+			buf := make([]byte, hostarch.PageSize)
+			n, err := mm.CopyIn(ctx, addr, buf, usermem.IOOpts{})
+			if err != test.wantErr || n != 0 {
+				t.Errorf("CopyIn got (%d, %v) want (0, %v)", n, err, test.wantErr)
+			}
+			if m.fills != test.wantFills {
+				t.Errorf("got %d fills want %d", m.fills, test.wantFills)
+			}
+			if got := m.refs.Load(); got != 1 {
+				t.Errorf("MappingIdentity refs got %d want 1 (the vma's)", got)
+			}
+		})
 	}
 }

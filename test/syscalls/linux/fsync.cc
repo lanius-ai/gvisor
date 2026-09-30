@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <string>
 
 #include "gmock/gmock.h"
@@ -60,12 +61,20 @@ TEST(FsyncTest, ODsyncWriteSucceeds) {
 }
 
 TEST(FsyncTest, TempDirSucceeds) {
+  // The test FUSE server (go-fuse's loopback) answers FUSE_FSYNCDIR with
+  // ENOTSUP, which the sentry reports as Linux does.
+  const char* fuse = getenv("GVISOR_FUSE_TEST");
+  SKIP_IF(fuse != nullptr && std::string(fuse) == "TRUE");
   auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(dir.path(), O_RDONLY | O_DIRECTORY));
   EXPECT_THAT(fsync(fd.get()), SyscallSucceeds());
 }
 
 TEST(FsyncTest, FdatasyncTempDirSucceeds) {
+  // The test FUSE server (go-fuse's loopback) answers FUSE_FSYNCDIR with
+  // ENOTSUP, which the sentry reports as Linux does.
+  const char* fuse = getenv("GVISOR_FUSE_TEST");
+  SKIP_IF(fuse != nullptr && std::string(fuse) == "TRUE");
   auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(dir.path(), O_RDONLY | O_DIRECTORY));
   EXPECT_THAT(fdatasync(fd.get()), SyscallSucceeds());

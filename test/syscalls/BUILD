@@ -413,6 +413,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     test = "//test/syscalls/linux:madvise_test",
 )
 
@@ -429,6 +430,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     test = "//test/syscalls/linux:mincore_test",
 )
 
@@ -450,6 +452,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     test = "//test/syscalls/linux:mlock_test",
 )
 
@@ -460,6 +463,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     size = "medium",
     shard_count = more_shards,
     test = "//test/syscalls/linux:mmap_test",
@@ -483,6 +487,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     size = "medium",
     test = "//test/syscalls/linux:mremap_test",
 )
@@ -492,6 +497,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     size = "medium",
     test = "//test/syscalls/linux:msync_test",
 )

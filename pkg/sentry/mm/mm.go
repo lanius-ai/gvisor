@@ -33,6 +33,11 @@
 // Only mm.MemoryManager.Fork is permitted to lock mm.MemoryManager.activeMu in
 // multiple mm.MemoryManagers, as it does so in a well-defined order (forked
 // child first).
+//
+// memmap.Mappable.Translate must not block on other tasks, whose syscalls may
+// take kernel.TaskSet.mu. Mappables that need such I/O return memmap.ErrFill
+// from Translate; getPMAsLocked callers that can then release their mm locks
+// call memmap.Filler.Fill with no mm locks held and retry (see fillAndUnlock).
 package mm
 
 import (
