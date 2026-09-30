@@ -69,7 +69,12 @@ func (dc *deviceConn) call(ctx context.Context, r *Request) (*Response, error) {
 	return res, nil
 }
 
-func (dc *deviceConn) release(ctx context.Context) {}
+// release aborts the connection when the filesystem is released (the last
+// unmount), so the server's blocked /dev/fuse read fails with ENODEV and the
+// server exits, as with Linux's fuse_kill_sb_anon() => fuse_abort_conn().
+func (dc *deviceConn) release(ctx context.Context) {
+	dc.conn.Abort(ctx)
+}
 
 // connection is the struct by which the sentry communicates with the FUSE server daemon.
 //
@@ -526,7 +531,8 @@ func (conn *connection) readiness(ready waiter.EventMask) waiter.EventMask {
 	defer conn.mu.Unlock()
 	// FD is always writable.
 	ready |= waiter.WritableEvents
-	if !conn.queue.Empty() {
+	if !conn.connected || !conn.queue.Empty() {
+		// An aborted connection is readable: read() fails with ENODEV.
 		// Have reqs available, FD is readable.
 		ready |= waiter.ReadableEvents
 	}
