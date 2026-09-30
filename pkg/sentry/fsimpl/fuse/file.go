@@ -168,12 +168,7 @@ func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions)
 	if err := vfs.CheckSetStat(ctx, creds, &opts, inode.filemode(), nil, auth.KUID(inode.uid.Load()), auth.KGID(inode.gid.Load())); err != nil {
 		return err
 	}
-	oldSize := inode.size.Load()
-	if err := inode.setAttr(ctx, fs, creds, opts, fhOptions{useFh: true, fh: fd.Fh}); err != nil {
-		return err
-	}
-	inode.grow(ctx, oldSize)
-	return nil
+	return inode.setAttr(ctx, fs, creds, opts, fhOptions{useFh: true, fh: fd.Fh})
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
@@ -186,7 +181,13 @@ func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error
 	if fs.conn.noOpen {
 		return linuxerr.EINVAL
 	}
-	if fs.conn.noFsync {
+	// Like Linux's fuse_dir_fsync(), directories are synced with
+	// FUSE_FSYNCDIR.
+	opcode, noSync := linux.FUSEOpcode(linux.FUSE_FSYNC), &fs.conn.noFsync
+	if inode.filemode().IsDir() {
+		opcode, noSync = linux.FUSE_FSYNCDIR, &fs.conn.noFsyncDir
+	}
+	if *noSync {
 		return nil
 	}
 
@@ -201,13 +202,13 @@ func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error
 	}
 	// fsync must not return before the server has synced the file, and must
 	// report its errors (Linux's fuse_fsync_common()).
-	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FSYNC, &in)
+	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, opcode, &in)
 	res, err := fs.conn.Call(ctx, req)
 	if err != nil {
 		return err
 	}
 	if err := res.Error(); linuxerr.Equals(linuxerr.ENOSYS, err) {
-		fs.conn.noFsync = true
+		*noSync = true
 	} else if err != nil {
 		return err
 	}

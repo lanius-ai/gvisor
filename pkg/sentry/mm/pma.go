@@ -377,6 +377,9 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							panic(fmt.Sprintf("Mappable(%T).Translate(%v, %v, %v): %v", vma.mappable, reqMR, optMR, perms, err))
 						}
 					}
+					if err == memmap.ErrFill {
+						err = fillError(vma, reqMR, optMR, perms, ts)
+					}
 					// Install a pma for each translation.
 					if len(ts) == 0 {
 						return pstart, pgap, err
@@ -545,6 +548,9 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							panic(fmt.Sprintf("Mappable(%T).Translate(%v, %v, %v): %v", vma.mappable, reqMR, optMR, perms, err))
 						}
 					}
+					if err == memmap.ErrFill {
+						err = fillError(vma, reqMR, optMR, perms, ts)
+					}
 					// Remove the part of the existing pma covered by new
 					// Translations, then insert new pmas. This doesn't change
 					// RSS.
@@ -606,6 +612,87 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 		}
 		vseg = vseg.NextSegment()
 	}
+}
+
+// fillRequest is carried by the memmap.BusError that getPMAsLocked returns
+// when a vma's Mappable returned memmap.ErrFill from Translate. Callers that
+// can release their mm locks pass it to fillAndUnlock and retry; for other
+// callers it is an ordinary error (SIGBUS for faults, EFAULT for syscalls).
+type fillRequest struct {
+	filler   memmap.Filler
+	id       memmap.MappingIdentity
+	required memmap.MappableRange
+	optional memmap.MappableRange
+	at       hostarch.AccessType
+}
+
+// Error implements error.Error.
+func (fr *fillRequest) Error() string {
+	return fmt.Sprintf("translation of %v requires Filler.Fill", fr.required)
+}
+
+// fillError returns the error for a Translate(required, optional, at) of
+// vma.mappable that returned memmap.ErrFill after translating ts.
+//
+// Preconditions: mm.mappingMu must be locked.
+func fillError(vma *vma, required, optional memmap.MappableRange, at hostarch.AccessType, ts []memmap.Translation) error {
+	filler, ok := vma.mappable.(memmap.Filler)
+	if !ok || vma.id == nil {
+		// E.g. a wrapping Mappable that forwards Translate but not Fill.
+		return &memmap.BusError{Err: linuxerr.EIO}
+	}
+	if len(ts) != 0 {
+		required.Start = ts[len(ts)-1].Source.End
+	}
+	return &memmap.BusError{Err: &fillRequest{filler: filler, id: vma.id, required: required, optional: optional, at: at}}
+}
+
+// fillRequestOf returns the fillRequest carried by err, or nil.
+func fillRequestOf(err error) *fillRequest {
+	if be, ok := err.(*memmap.BusError); ok {
+		fr, _ := be.Err.(*fillRequest)
+		return fr
+	}
+	return nil
+}
+
+// fillAndUnlock releases mm.activeMu and mm.mappingMu, then calls
+// fr.filler.Fill. The caller retries after it returns nil.
+//
+// Preconditions:
+//   - mm.mappingMu must be locked for reading.
+//   - mm.activeMu must be locked for writing.
+//   - fr was returned by getPMAsLocked with both locks held since.
+//
+// Postconditions: mm.mappingMu and mm.activeMu are unlocked.
+func (mm *MemoryManager) fillAndUnlock(ctx context.Context, fr *fillRequest) error {
+	// The vma holding fr.id may be removed once mappingMu is unlocked; its
+	// MappingIdentity keeps the Mappable usable.
+	fr.id.IncRef()
+	mm.activeMu.Unlock()
+	mm.mappingMu.RUnlock()
+	err := fr.filler.Fill(ctx, fr.required, fr.optional, fr.at)
+	fr.id.DecRef(ctx)
+	return err
+}
+
+// maxFillRetries bounds consecutive fills that make no progress in one
+// operation, e.g. because the filled range is truncated before the retry.
+const maxFillRetries = 4
+
+// fillRetries counts consecutive fills at the same point of progress.
+type fillRetries struct {
+	progress uint64
+	n        int
+}
+
+// more records a fill at progress and returns true if another one is allowed.
+func (r *fillRetries) more(progress uint64) bool {
+	if progress != r.progress {
+		r.progress, r.n = progress, 0
+	}
+	r.n++
+	return r.n <= maxFillRetries
 }
 
 func hugepageAligned(ar hostarch.AddrRange) hostarch.AddrRange {

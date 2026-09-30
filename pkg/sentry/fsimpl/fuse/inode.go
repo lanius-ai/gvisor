@@ -85,7 +85,7 @@ type inode struct {
 	watches vfs.Watches
 
 	// attrMu protects the attributes of this inode.
-	attrMu sync.Mutex `state:"nosave"`
+	attrMu inodeAttrMutex `state:"nosave"`
 
 	// +checklocks:attrMu
 	ino atomicbitops.Uint64 // Stat data, not accessed for path walking.
@@ -118,7 +118,7 @@ type inode struct {
 	// mmap.go.
 
 	// mapsMu protects mappings.
-	mapsMu sync.Mutex `state:"nosave"`
+	mapsMu inodeMapsMutex `state:"nosave"`
 
 	// mappings tracks mappings of the file into memmap.MappingSpaces.
 	//
@@ -127,11 +127,11 @@ type inode struct {
 
 	// ioMu serializes filling, writing back and dropping cached pages, which
 	// happen with dataMu released (see mmap.go).
-	ioMu sync.Mutex `state:"nosave"`
+	ioMu inodeIOMutex `state:"nosave"`
 
-	// dataMu protects cache, dirty, mappers and writers. It is never held
+	// dataMu protects cache, dirty and writers. It is never held
 	// across a request to the server.
-	dataMu sync.Mutex `state:"nosave"`
+	dataMu inodeDataMutex `state:"nosave"`
 
 	// cache maps file offsets to fs.mf pages holding mapped file contents.
 	//
@@ -142,12 +142,6 @@ type inode struct {
 	//
 	// +checklocks:dataMu
 	dirty fsutil.DirtySet
-
-	// mappers are FDs that were mapped; any of their handles can fill the
-	// cache.
-	//
-	// +checklocks:dataMu
-	mappers []*regularFileFD
 
 	// writers are writable FDs that were mapped shared; any of their handles
 	// can write back dirty pages (Linux's fuse_inode.write_files).
@@ -891,20 +885,20 @@ func (i *inode) Stat(ctx context.Context, fs *vfs.Filesystem, opts vfs.StatOptio
 	// unsupported.
 	opts.Mask &= linux.STATX_BASIC_STATS
 
+	// Report cached attributes without attrMu if no sync is needed: this is
+	// reached with mm.MemoryManager.mappingMu locked (/proc/[pid]/maps =>
+	// memmap.MappingIdentity.DeviceID/InodeID), while read(2) and write(2)
+	// hold attrMu across copies to and from application memory, which lock
+	// mappingMu. The attributes are atomics.
+	if opts.Mask == 0 || opts.Sync == linux.AT_STATX_DONT_SYNC {
+		return statFromFUSEAttr(i.getFUSEAttr(), opts.Mask, i.fs.devMinor), nil // +checklocksforce: see above.
+	}
+
 	i.attrMu.Lock()
 	defer i.attrMu.Unlock()
 
-	var sync bool
-	if opts.Mask == 0 {
-		sync = false
-	} else if opts.Sync == linux.AT_STATX_FORCE_SYNC {
-		sync = true
-	} else if opts.Sync == linux.AT_STATX_DONT_SYNC {
-		sync = false
-	} else {
-		// TODO(gvisor.dev/issue/3679): support per-field cache validity
-		sync = i.attrTime.Before(i.fs.clock.Now())
-	}
+	// TODO(gvisor.dev/issue/3679): support per-field cache validity
+	sync := opts.Sync == linux.AT_STATX_FORCE_SYNC || i.attrTime.Before(i.fs.clock.Now())
 
 	if sync {
 		attr, err := i.getAttr(ctx, creds, fs, opts, 0, 0)
@@ -956,12 +950,7 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	if opts.Stat.Mask == 0 {
 		return nil
 	}
-	oldSize := i.size.Load()
-	if err := i.setAttr(ctx, fs, creds, opts, fhOptions{useFh: false}); err != nil {
-		return err
-	}
-	i.grow(ctx, oldSize)
-	return nil
+	return i.setAttr(ctx, fs, creds, opts, fhOptions{useFh: false})
 }
 
 // GetXattr implements kernfs.InodeWithXattrs.GetXattr.

@@ -168,7 +168,9 @@ func (fd *DeviceFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 func (fd *DeviceFD) EventRegister(e *waiter.Entry) error {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
+	// An aborted connection (e.g. unmounted) stays pollable, so that the
+	// server sees EventErr as with Linux's fuse_dev_poll().
+	if fd.conn == nil {
 		return linuxerr.EPERM
 	}
 	fd.conn.waitQueue.EventRegister(e)
@@ -179,7 +181,7 @@ func (fd *DeviceFD) EventRegister(e *waiter.Entry) error {
 func (fd *DeviceFD) EventUnregister(e *waiter.Entry) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
+	if fd.conn == nil {
 		return
 	}
 	fd.conn.waitQueue.EventUnregister(e)

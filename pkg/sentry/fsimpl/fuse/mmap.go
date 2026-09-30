@@ -45,13 +45,14 @@ import (
 // Hence:
 //
 //   - Translate never sends requests; it only serves cached pages and takes
-//     only dataMu.
+//     only dataMu. For uncached pages within EOF it returns memmap.ErrFill.
+//   - mm then releases its locks and calls Fill, which reads the missing pages
+//     (plus a read-around window, like Linux's mmap readahead) from the server
+//     with the faulting FD's handle, and retries Translate.
 //   - dataMu is never held across a server request. Fills and writebacks are
 //     serialized by ioMu and copy data with dataMu released.
-//   - Every mapped page within EOF stays cached. Pages are read from the
-//     server where blocking is safe: in AddMapping (mmap, mremap; under
-//     mm.MemoryManager.mappingMu, which ranks above TaskSet.mu), when the file
-//     grows, and when the cache is revalidated on open.
+//   - Clean cached pages are reread in place when the cache is revalidated on
+//     open.
 //
 // Coherence rules:
 //
@@ -80,18 +81,22 @@ import (
 //
 // Lock order: inode.attrMu > inode.mapsMu > inode.ioMu > inode.dataMu.
 //
-// ponytail: mapping a range reads all of it up front (no lazy faulting),
-// which costs I/O for large sparse mappings such as big git packs; lazy fills
-// need a Translate that can drop mm locks to block, which gVisor's mm does
-// not offer. File growth by a writer outside this sandbox's VFS is not filled
-// into mappings (faults there SIGBUS) and writably mapped pages are not
-// revalidated on open: the FUSE server must be the only writer, as for
-// AgentFS.
+// ponytail: file contents written by someone other than this sandbox's VFS
+// (e.g. the server itself) are not coherent with pages already cached: the
+// zeroes past the old EOF in a cached last page are kept when the file grows,
+// and writably mapped pages are not revalidated on open. The FUSE server must
+// be the only writer, as for AgentFS; FUSE_NOTIFY_INVAL_INODE would lift this.
 
 var (
 	_ memmap.Mappable             = (*regularFileFD)(nil)
+	_ memmap.Filler               = (*regularFileFD)(nil)
 	_ pgalloc.EvictableMemoryUser = (*inode)(nil)
 )
+
+// fillAround is the aligned window that Fill reads around a missing page, as
+// Linux's filemap_fault() reads around a fault (ra_pages, which FUSE sets from
+// the negotiated max_readahead).
+const fillAround = fuseDefaultMaxReadahead
 
 // wholeFile covers every page-aligned file offset.
 var wholeFile = memmap.MappableRange{Start: 0, End: hostarch.PageRoundDown(uint64(math.MaxInt64))}
@@ -108,11 +113,6 @@ func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpt
 		return linuxerr.ENODEV
 	}
 	i.dataMu.Lock()
-	if !fd.mapper {
-		// Any mapped FD's handle can fill the cache.
-		fd.mapper = true
-		i.mappers = append(i.mappers, fd)
-	}
 	if !opts.Private && opts.MaxPerms.Write && !fd.writer {
 		// This FD's handle may be used to write back pages dirtied through
 		// any shared mapping (Linux's fuse_link_write_file()).
@@ -129,15 +129,10 @@ func (fd *regularFileFD) AddMapping(ctx context.Context, ms memmap.MappingSpace,
 	i.mapsMu.Lock()
 	defer i.mapsMu.Unlock()
 	mapped := i.mappings.AddMapping(ms, ar, offset, writable)
-	// Mapped pages must not be evicted: Translate can't refill them.
+	// As gofer's, Evict only drops unmapped pages, so that it needn't
+	// invalidate translations.
 	for _, r := range mapped {
 		i.fs.mf.MarkUnevictable(i, pgalloc.EvictableRange{Start: r.Start, End: r.End})
-	}
-	i.ioMu.Lock()
-	defer i.ioMu.Unlock()
-	if err := i.fillLocked(ctx, fd, memmap.MappableRange{Start: offset, End: offset + uint64(ar.Length())}); err != nil {
-		i.mappings.RemoveMapping(ms, ar, offset, writable)
-		return err
 	}
 	return nil
 }
@@ -211,15 +206,28 @@ func (fd *regularFileFD) Translate(ctx context.Context, required, optional memma
 		translatedEnd = segMR.End
 	}
 	if translatedEnd < required.End {
-		// A mapped page within EOF that isn't cached: the file grew outside
-		// this sandbox's view, or a fill failed. See the file comment.
-		log.Warningf("fuse: inode %d: uncached mapped range %v", i.nodeID, memmap.MappableRange{Start: translatedEnd, End: required.End})
-		return ts, &memmap.BusError{Err: linuxerr.EIO}
+		// Read the missing pages in Fill, without mm locks.
+		return ts, memmap.ErrFill
 	}
 	if beyondEOF {
 		return ts, &memmap.BusError{Err: io.EOF}
 	}
 	return ts, nil
+}
+
+// Fill implements memmap.Filler.Fill. It reads the uncached pages of required
+// within EOF, and those of the fillAround-aligned window around it within
+// optional.
+func (fd *regularFileFD) Fill(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) error {
+	mr := memmap.MappableRange{Start: required.Start &^ (fillAround - 1), End: (required.End + fillAround - 1) &^ (fillAround - 1)}
+	if mr.End < required.End {
+		mr.End = required.End // overflow
+	}
+	mr = mr.Intersect(optional)
+	i := fd.inode()
+	i.ioMu.Lock()
+	defer i.ioMu.Unlock()
+	return i.fillLocked(ctx, fd, mr)
 }
 
 // InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
@@ -258,7 +266,7 @@ func (i *inode) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 // fd's handle and inserts them into the cache.
 //
 // Preconditions: i.ioMu is locked; i.dataMu is not. The caller must not hold
-// mm locks below mm.MemoryManager.mappingMu (see the file comment).
+// mm locks (see the file comment).
 func (i *inode) fillLocked(ctx context.Context, fd *regularFileFD, mr memmap.MappableRange) error {
 	size := i.size.Load()
 	pgend, _ := hostarch.PageRoundUp(size)
@@ -296,44 +304,6 @@ func (i *inode) fillLocked(ctx context.Context, fd *regularFileFD, mr memmap.Map
 		}
 	}
 	return nil
-}
-
-// fillMapped fills uncached, mapped pages in mr, e.g. after the file grew.
-//
-// Preconditions: mapsMu, ioMu and dataMu are not locked.
-func (i *inode) fillMapped(ctx context.Context, mr memmap.MappableRange) error {
-	i.mapsMu.Lock()
-	defer i.mapsMu.Unlock()
-	i.ioMu.Lock()
-	defer i.ioMu.Unlock()
-	i.dataMu.Lock()
-	var fd *regularFileFD
-	if len(i.mappers) != 0 {
-		fd = i.mappers[0]
-	}
-	i.dataMu.Unlock()
-	if fd == nil {
-		return nil
-	}
-	for seg := i.mappings.LowerBoundSegment(mr.Start); seg.Ok() && seg.Start() < mr.End; seg = seg.NextSegment() {
-		if err := i.fillLocked(ctx, fd, seg.Range().Intersect(mr)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// grow fills mapped pages that became valid when the file grew from oldSize
-// (i.size is already updated).
-func (i *inode) grow(ctx context.Context, oldSize uint64) {
-	newSize := i.size.Load()
-	if newSize <= oldSize || i.fs.mf == nil {
-		return
-	}
-	newpgend, _ := hostarch.PageRoundUp(newSize)
-	if err := i.fillMapped(ctx, memmap.MappableRange{Start: hostarch.PageRoundDown(oldSize), End: newpgend}); err != nil {
-		log.Warningf("fuse: filling mapped pages after growth to %d: %v", newSize, err)
-	}
 }
 
 // readToBlocksAt reads from the server into dsts using fd's handle.
@@ -494,8 +464,8 @@ func (i *inode) truncateCache(oldSize, newSize uint64) {
 // revalidateCache implements an open reply without FOPEN_KEEP_CACHE (Linux's
 // invalidate_inode_pages2()): write back dirty pages, drop unmapped cached
 // pages and reread mapped clean pages in place, so mappings observe changes
-// made behind the sentry's back without being invalidated (Translate can't
-// refill).
+// made behind the sentry's back. Mapped pages aren't dropped: Translate takes
+// only dataMu, so it could hand out a page between Invalidate and Drop.
 //
 // Preconditions: i.attrMu is locked; mapsMu, ioMu and dataMu are not.
 func (i *inode) revalidateCache(ctx context.Context, fd *regularFileFD) {
@@ -582,11 +552,6 @@ func (fd *regularFileFD) Release(ctx context.Context) {
 		i.writers = removeFD(i.writers, fd)
 		i.dataMu.Unlock()
 		i.ioMu.Unlock()
-	}
-	if fd.mapper {
-		i.dataMu.Lock()
-		i.mappers = removeFD(i.mappers, fd)
-		i.dataMu.Unlock()
 	}
 	fd.fileDescription.Release(ctx)
 }

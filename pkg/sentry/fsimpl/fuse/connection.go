@@ -271,11 +271,12 @@ type connection struct {
 	// then created with FUSE_MKNOD followed by FUSE_OPEN, as Linux does.
 	noCreate bool
 
-	// noFlush and noFsync are set when the server answers FUSE_FLUSH or
-	// FUSE_FSYNC with ENOSYS; like Linux, those requests are then skipped and
-	// treated as successful.
-	noFlush bool
-	noFsync bool
+	// noFlush, noFsync and noFsyncDir are set when the server answers
+	// FUSE_FLUSH, FUSE_FSYNC or FUSE_FSYNCDIR with ENOSYS; like Linux, those
+	// requests are then skipped and treated as successful.
+	noFlush    bool
+	noFsync    bool
+	noFsyncDir bool
 }
 
 func linuxError(err error) error {

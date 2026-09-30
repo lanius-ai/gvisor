@@ -37,9 +37,8 @@ type regularFileFD struct {
 	// +checklocks:offMu
 	off int64
 
-	// mapper and writer are true if the FD is in inode.mappers and
-	// inode.writers respectively. Protected by inode.dataMu.
-	mapper bool
+	// writer is true if the FD is in inode.writers. Protected by
+	// inode.dataMu.
 	writer bool
 }
 
@@ -269,10 +268,9 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		return 0, offset, linuxerr.EIO
 	}
 
-	if oldSize := inode.size.Load(); offset > int64(oldSize) {
+	if offset > int64(inode.size.Load()) {
 		inode.size.Store(uint64(offset))
 		inode.fs.conn.attributeVersion.Add(1)
-		inode.grow(ctx, oldSize)
 	}
 	inode.touchCMtime()
 	return n, offset, err
