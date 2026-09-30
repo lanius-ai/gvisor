@@ -1,0 +1,86 @@
+# Builds the craypot gVisor release (craypot/build.sh), gates it on the
+# in-sandbox FUSE harness (craypot/harness/gate.sh) and, on pushes to craypot,
+# publishes gvisor.tar.zstd + .sha256 as GitHub release craypot-<date>-<sha>.
+# Copying the release into GCS is manual (craypot deploy/substrate/README.md).
+name: craypot release
+
+on:
+  push:
+    branches: [craypot]
+  pull_request:
+    branches: [craypot]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: craypot-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 200 # build.sh reads the base "Merge release-..." commit
+          filter: blob:none
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: false
+      - name: Autogen state is current
+        run: craypot/regen-fuse-state.sh && git diff --exit-code
+      - name: Build
+        run: craypot/build.sh out
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Harness rootfs
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: craypot/harness
+          tags: craypot-gvisor-harness
+          load: true
+          cache-from: type=gha,scope=harness
+          cache-to: type=gha,scope=harness,mode=max
+      - name: Gate
+        run: craypot/harness/gate.sh out/x86_64/dist gate
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-logs
+          path: |
+            gate/*.txt
+            gate/*.log
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gvisor-x86_64
+          path: |
+            out/x86_64/gvisor.tar.zstd
+            out/x86_64/gvisor.tar.zstd.sha256
+            out/x86_64/version
+          compression-level: 0
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gvisor-x86_64
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum -c gvisor.tar.zstd.sha256
+          date=$(date -u +%Y%m%d); tag="craypot-$date-${GITHUB_SHA::9}"
+          if gh release view "$tag" >/dev/null 2>&1; then echo "$tag exists"; exit 0; fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" \
+            --notes "runsc $(cat version), x86_64, nightly layout. sha256 $(cut -d' ' -f1 gvisor.tar.zstd.sha256). GCS: gs://lanius-craypot-gvisor-assets/gvisor/fusefork/$date/x86_64/gvisor.tar.zstd" \
+            gvisor.tar.zstd gvisor.tar.zstd.sha256
