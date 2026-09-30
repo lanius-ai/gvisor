@@ -191,9 +191,24 @@ func umaskFromContext(ctx context.Context) uint32 {
 	return umask
 }
 
+// maxValidSec caps entry_valid/attr_valid timeouts (about 68 years), as
+// Linux's fuse_time_to_jiffies() caps them at MAX_JIFFY_OFFSET.
+const maxValidSec = 1 << 31
+
+// validTimeout converts an entry_valid/attr_valid timeout. The protocol's
+// timeouts are unsigned; callers pass them as int64, so huge values (e.g.
+// Rust's Duration::MAX from fuser servers) arrive negative and used to
+// expire immediately, turning every stat and path walk into a round trip.
+func validTimeout(sec, nsec int64) ktime.Time {
+	if sec < 0 || sec > maxValidSec {
+		sec, nsec = maxValidSec, 0
+	}
+	return ktime.FromTimespec(linux.Timespec{Sec: sec, Nsec: nsec})
+}
+
 // +checklocks:i.attrMu
 func (i *inode) updateEntryTime(entrySec, entryNSec int64) {
-	entryTime := ktime.FromTimespec(linux.Timespec{Sec: entrySec, Nsec: entryNSec})
+	entryTime := validTimeout(entrySec, entryNSec)
 	SeqAtomicStoreTime(&i.entryTimeSeq, &i.entryTime, i.fs.clock.Now().AddTime(entryTime))
 }
 
@@ -437,7 +452,7 @@ func (i *inode) updateAttrs(attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.fs.conn.mu.Lock()
 	i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 	i.fs.conn.mu.Unlock()
-	i.attrTime = i.fs.clock.Now().AddTime(ktime.FromTimespec(linux.Timespec{Sec: validSec, Nsec: validNSec}))
+	i.attrTime = i.fs.clock.Now().AddTime(validTimeout(validSec, validNSec))
 
 	i.ino.Store(attr.Ino)
 
