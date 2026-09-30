@@ -265,6 +265,12 @@ type connection struct {
 	// noCreate if FUSE server doesn't support the create operation. Files are
 	// then created with FUSE_MKNOD followed by FUSE_OPEN, as Linux does.
 	noCreate bool
+
+	// noFlush and noFsync are set when the server answers FUSE_FLUSH or
+	// FUSE_FSYNC with ENOSYS; like Linux, those requests are then skipped and
+	// treated as successful.
+	noFlush bool
+	noFsync bool
 }
 
 func linuxError(err error) error {

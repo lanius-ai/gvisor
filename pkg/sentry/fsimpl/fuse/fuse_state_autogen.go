@@ -4,7 +4,6 @@ package fuse
 
 import (
 	"context"
-
 	"gvisor.dev/gvisor/pkg/state"
 )
 
@@ -45,6 +44,8 @@ func (conn *connection) StateFields() []string {
 		"dontMask",
 		"noOpen",
 		"noCreate",
+		"noFlush",
+		"noFsync",
 	}
 }
 
@@ -88,6 +89,8 @@ func (conn *connection) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(28, &conn.dontMask)
 	stateSinkObject.Save(29, &conn.noOpen)
 	stateSinkObject.Save(30, &conn.noCreate)
+	stateSinkObject.Save(31, &conn.noFlush)
+	stateSinkObject.Save(32, &conn.noFsync)
 }
 
 // +checklocksignore
@@ -121,6 +124,8 @@ func (conn *connection) StateLoad(ctx context.Context, stateSourceObject state.S
 	stateSourceObject.Load(28, &conn.dontMask)
 	stateSourceObject.Load(29, &conn.noOpen)
 	stateSourceObject.Load(30, &conn.noCreate)
+	stateSourceObject.Load(31, &conn.noFlush)
+	stateSourceObject.Load(32, &conn.noFsync)
 	stateSourceObject.LoadValue(2, new(bool), func(y any) { conn.loadInitializedChan(ctx, y.(bool)) })
 	stateSourceObject.LoadValue(4, new(int), func(y any) { conn.loadFullQueueCh(ctx, y.(int)) })
 	stateSourceObject.AfterLoad(func() { conn.afterLoad(ctx) })

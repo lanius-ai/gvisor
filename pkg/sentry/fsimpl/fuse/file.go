@@ -101,7 +101,7 @@ func (fd *fileDescription) OnClose(ctx context.Context) error {
 	inode.attrMu.Lock()
 	defer inode.attrMu.Unlock()
 
-	if fs.conn.noOpen {
+	if fs.conn.noOpen || fs.conn.noFlush {
 		return nil
 	}
 	if fd.OpenFlag&linux.FOPEN_NOFLUSH != 0 {
@@ -117,7 +117,13 @@ func (fd *fileDescription) OnClose(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return res.Error()
+	if err := res.Error(); linuxerr.Equals(linuxerr.ENOSYS, err) {
+		// As Linux's fuse_flush().
+		fs.conn.noFlush = true
+	} else if err != nil {
+		return err
+	}
+	return nil
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -175,6 +181,9 @@ func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error
 	if fs.conn.noOpen {
 		return linuxerr.EINVAL
 	}
+	if fs.conn.noFsync {
+		return nil
+	}
 
 	var syncFlags uint32
 	if opts.DataOnly {
@@ -185,10 +194,18 @@ func (fd *fileDescription) Sync(ctx context.Context, opts vfs.SyncOptions) error
 		Fh:         fd.Fh,
 		FsyncFlags: syncFlags,
 	}
-	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
+	// fsync must not return before the server has synced the file, and must
+	// report its errors (Linux's fuse_fsync_common()).
 	req := fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FSYNC, &in)
-	// The reply will be ignored since no callback is defined in asyncCallBack().
-	fs.conn.CallAsync(ctx, req)
+	res, err := fs.conn.Call(ctx, req)
+	if err != nil {
+		return err
+	}
+	if err := res.Error(); linuxerr.Equals(linuxerr.ENOSYS, err) {
+		fs.conn.noFsync = true
+	} else if err != nil {
+		return err
+	}
 	return nil
 }
 
