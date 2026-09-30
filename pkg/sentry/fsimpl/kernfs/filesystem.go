@@ -813,6 +813,17 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return nil
 	}
 
+	// A directory can't be moved into itself or its own subtree (Linux's
+	// lock_rename() => d_ancestor()). Without this check the request reaches
+	// the implementation: a FUSE server may deadlock on its own path locks
+	// (libfuse's high-level API) or create a detached cycle. fs.mu, held for
+	// writing, keeps the parent chain stable.
+	for d := dstDir; d != nil; d = d.parent.Load() {
+		if d == src {
+			return linuxerr.EINVAL
+		}
+	}
+
 	var dstVFSD *vfs.Dentry
 	if dst != nil {
 		dstVFSD = dst.VFSDentry()

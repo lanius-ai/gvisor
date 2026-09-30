@@ -22,8 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/fsutil"
-	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -39,22 +37,10 @@ type regularFileFD struct {
 	// +checklocks:offMu
 	off int64
 
-	// mapsMu protects mappings.
-	mapsMu sync.Mutex `state:"nosave"`
-
-	// mappings tracks mappings of the file into memmap.MappingSpaces.
-	//
-	// Protected by mapsMu.
-	mappings memmap.MappingSet
-
-	// dataMu protects the fields below.
-	dataMu sync.RWMutex `state:"nosave"`
-
-	// data maps offsets into the file to offsets into memFile that store
-	// the file's data.
-	//
-	// Protected by dataMu.
-	data fsutil.FileRangeSet
+	// mapper and writer are true if the FD is in inode.mappers and
+	// inode.writers respectively. Protected by inode.dataMu.
+	mapper bool
+	writer bool
 }
 
 // Seek implements vfs.FileDescriptionImpl.Allocate.
@@ -140,15 +126,24 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	inode.attrMu.Lock()
 	defer inode.attrMu.Unlock()
 
-	// Reading beyond EOF, update file size if outdated.
+	// Reading beyond EOF, update file size if outdated. As in Linux's
+	// fuse_file_read_iter() => fuse_update_attributes(), only ask the server
+	// once the cached attributes have expired (attr_valid).
 	if uint64(offset+size) > inode.size.Load() {
-		if err := inode.reviseAttr(ctx, linux.FUSE_GETATTR_FH, fd.Fh); err != nil {
-			return 0, err
+		if inode.fs.clock.Now().After(inode.attrTime) {
+			if err := inode.reviseAttr(ctx, linux.FUSE_GETATTR_FH, fd.Fh); err != nil {
+				return 0, err
+			}
 		}
 		// If the offset after update is still too large, return error.
 		if uint64(offset) >= inode.size.Load() {
 			return 0, io.EOF
 		}
+	}
+
+	// Make stores through shared mappings visible to read(2).
+	if err := inode.writebackRange(ctx, uint64(offset), uint64(size)); err != nil {
+		return 0, err
 	}
 
 	// Truncate the read with updated file size.
@@ -274,15 +269,11 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		return 0, offset, linuxerr.EIO
 	}
 
-	if offset > int64(inode.size.Load()) {
+	if oldSize := inode.size.Load(); offset > int64(oldSize) {
 		inode.size.Store(uint64(offset))
 		inode.fs.conn.attributeVersion.Add(1)
+		inode.grow(ctx, oldSize)
 	}
 	inode.touchCMtime()
 	return n, offset, err
-}
-
-// ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
-func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
-	return linuxerr.ENOSYS
 }

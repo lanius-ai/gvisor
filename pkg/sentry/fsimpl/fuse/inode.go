@@ -25,9 +25,11 @@ import (
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -111,6 +113,47 @@ type inode struct {
 
 	// +checklocks:attrMu
 	blockSize atomicbitops.Uint32 // 0 if unknown.
+
+	// The fields below implement memory mappings of regular files; see
+	// mmap.go.
+
+	// mapsMu protects mappings.
+	mapsMu sync.Mutex `state:"nosave"`
+
+	// mappings tracks mappings of the file into memmap.MappingSpaces.
+	//
+	// +checklocks:mapsMu
+	mappings memmap.MappingSet
+
+	// ioMu serializes filling, writing back and dropping cached pages, which
+	// happen with dataMu released (see mmap.go).
+	ioMu sync.Mutex `state:"nosave"`
+
+	// dataMu protects cache, dirty, mappers and writers. It is never held
+	// across a request to the server.
+	dataMu sync.Mutex `state:"nosave"`
+
+	// cache maps file offsets to fs.mf pages holding mapped file contents.
+	//
+	// +checklocks:dataMu
+	cache fsutil.FileRangeSet
+
+	// dirty tracks cached pages that must be written back to the server.
+	//
+	// +checklocks:dataMu
+	dirty fsutil.DirtySet
+
+	// mappers are FDs that were mapped; any of their handles can fill the
+	// cache.
+	//
+	// +checklocks:dataMu
+	mappers []*regularFileFD
+
+	// writers are writable FDs that were mapped shared; any of their handles
+	// can write back dirty pages (Linux's fuse_inode.write_files).
+	//
+	// +checklocks:dataMu
+	writers []*regularFileFD
 }
 
 func (i *inode) Mode() linux.FileMode {
@@ -171,7 +214,10 @@ func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid 
 
 // DecRef implements kernfs.Inode.DecRef.
 func (i *inode) DecRef(ctx context.Context) {
-	i.inodeRefs.DecRef(func() { i.Destroy(ctx) })
+	i.inodeRefs.DecRef(func() {
+		i.releaseCache()
+		i.Destroy(ctx)
+	})
 }
 
 func pidFromContext(ctx context.Context) uint32 {
@@ -191,9 +237,24 @@ func umaskFromContext(ctx context.Context) uint32 {
 	return umask
 }
 
+// maxValidSec caps entry_valid/attr_valid timeouts (about 68 years), as
+// Linux's fuse_time_to_jiffies() caps them at MAX_JIFFY_OFFSET.
+const maxValidSec = 1 << 31
+
+// validTimeout converts an entry_valid/attr_valid timeout. The protocol's
+// timeouts are unsigned; callers pass them as int64, so huge values (e.g.
+// Rust's Duration::MAX from fuser servers) arrive negative and used to
+// expire immediately, turning every stat and path walk into a round trip.
+func validTimeout(sec, nsec int64) ktime.Time {
+	if sec < 0 || sec > maxValidSec {
+		sec, nsec = maxValidSec, 0
+	}
+	return ktime.FromTimespec(linux.Timespec{Sec: sec, Nsec: nsec})
+}
+
 // +checklocks:i.attrMu
 func (i *inode) updateEntryTime(entrySec, entryNSec int64) {
-	entryTime := ktime.FromTimespec(linux.Timespec{Sec: entrySec, Nsec: entryNSec})
+	entryTime := validTimeout(entrySec, entryNSec)
 	SeqAtomicStoreTime(&i.entryTimeSeq, &i.entryTime, i.fs.clock.Now().AddTime(entryTime))
 }
 
@@ -280,13 +341,17 @@ func (i *inode) getFUSEAttr() linux.FUSEAttr {
 // statFromFUSEAttr makes attributes from linux.FUSEAttr to linux.Statx.
 func statFromFUSEAttr(attr linux.FUSEAttr, mask, devMinor uint32) linux.Statx {
 	var stat linux.Statx
+	// Every basic field is filled from attr, so report all requested basic
+	// fields as valid, as Linux's fuse_fillattr() does. VFS relies on this:
+	// execve() requires STATX_TYPE in the result mask.
+	stat.Mask = mask & linux.STATX_BASIC_STATS
 	stat.Blksize = attr.BlkSize
 	stat.DevMajor, stat.DevMinor = linux.UNNAMED_MAJOR, devMinor
 
 	rdevMajor, rdevMinor := linux.DecodeDeviceID(attr.Rdev)
 	stat.RdevMajor, stat.RdevMinor = uint32(rdevMajor), rdevMinor
 
-	if mask&linux.STATX_MODE != 0 {
+	if mask&(linux.STATX_TYPE|linux.STATX_MODE) != 0 {
 		stat.Mode = uint16(attr.Mode)
 	}
 	if mask&linux.STATX_NLINK != 0 {
@@ -433,7 +498,7 @@ func (i *inode) updateAttrs(attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.fs.conn.mu.Lock()
 	i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 	i.fs.conn.mu.Unlock()
-	i.attrTime = i.fs.clock.Now().AddTime(ktime.FromTimespec(linux.Timespec{Sec: validSec, Nsec: validNSec}))
+	i.attrTime = i.fs.clock.Now().AddTime(validTimeout(validSec, validNSec))
 
 	i.ino.Store(attr.Ino)
 
@@ -445,8 +510,10 @@ func (i *inode) updateAttrs(attr linux.FUSEAttr, validSec, validNSec int64) {
 	i.mtime.Store(attr.MTimeNsec())
 	i.ctime.Store(attr.CTimeNsec())
 
+	oldSize := i.size.Load()
 	i.size.Store(attr.Size)
 	i.nlink.Store(attr.Nlink)
+	i.truncateCache(oldSize, attr.Size)
 
 	if !i.fs.opts.defaultPermissions {
 		i.mode.Store(i.mode.Load() & ^uint32(linux.S_ISVTX))
@@ -590,7 +657,9 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 				i.fs.conn.mu.Lock()
 				i.attrVersion.Store(i.fs.conn.attributeVersion.Add(1))
 				i.fs.conn.mu.Unlock()
+				oldSize := i.size.Load()
 				i.size.Store(0)
+				i.truncateCache(oldSize, 0)
 				i.touchCMtime()
 			}
 		}
@@ -599,7 +668,6 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 		fd.OpenFlag &= ^uint32(linux.FOPEN_DIRECT_IO)
 	}
 
-	// TODO(gvisor.dev/issue/3234): invalidate mmap after implemented it for FUSE Inode
 	fd.DirectIO = fd.OpenFlag&linux.FOPEN_DIRECT_IO != 0
 	fdOptions := &vfs.FileDescriptionOptions{}
 	if fd.OpenFlag&linux.FOPEN_NONSEEKABLE != 0 {
@@ -610,6 +678,9 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 
 	if err := fd.vfsfd.Init(fdImpl, opts.Flags, rp.Credentials(), rp.Mount(), d.VFSDentry(), fdOptions); err != nil {
 		return nil, err
+	}
+	if regularFD, ok := fdImpl.(*regularFileFD); ok && fd.OpenFlag&linux.FOPEN_KEEP_CACHE == 0 && i.fs.mf != nil {
+		i.revalidateCache(ctx, regularFD)
 	}
 	return &fd.vfsfd, nil
 }
@@ -885,7 +956,12 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	if opts.Stat.Mask == 0 {
 		return nil
 	}
-	return i.setAttr(ctx, fs, creds, opts, fhOptions{useFh: false})
+	oldSize := i.size.Load()
+	if err := i.setAttr(ctx, fs, creds, opts, fhOptions{useFh: false}); err != nil {
+		return err
+	}
+	i.grow(ctx, oldSize)
+	return nil
 }
 
 // GetXattr implements kernfs.InodeWithXattrs.GetXattr.

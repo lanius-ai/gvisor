@@ -32,6 +32,22 @@ import (
 // at this moment.
 func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off uint64, size uint32) ([][]byte, uint32, error) {
 	attributeVersion := fs.conn.attributeVersion.Load()
+	outs, sizeRead, err := fs.readPages(ctx, fd, off, size)
+	if err != nil {
+		return nil, 0, err
+	}
+	fs.ReadCallback(ctx, fd.inode(), off, size, sizeRead, attributeVersion) // +checklocksforce: fd.inode() locks are held during fd operations.
+
+	// No bytes returned: offset >= EOF.
+	if len(outs) == 0 {
+		return nil, 0, io.EOF
+	}
+	return outs, sizeRead, nil
+}
+
+// readPages sends the FUSE_READ requests of ReadInPages without touching
+// inode attributes, so it may be called without inode.attrMu (mmap faults).
+func (fs *filesystem) readPages(ctx context.Context, fd *regularFileFD, off uint64, size uint32) ([][]byte, uint32, error) {
 
 	// Round up to a multiple of page size.
 	readSize, _ := hostarch.PageRoundUp(uint64(size))
@@ -75,6 +91,10 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 		if err != nil {
 			return nil, 0, err
 		}
+		// An error reply has no payload; don't mistake it for EOF.
+		if err := res.Error(); err != nil {
+			return nil, 0, err
+		}
 
 		// Not enough bytes in response,
 		// either we reached EOF,
@@ -94,13 +114,6 @@ func (fs *filesystem) ReadInPages(ctx context.Context, fd *regularFileFD, off ui
 		sizeRead += uint32(len(out))
 
 		pagesRead += pagesCanRead
-	}
-
-	defer fs.ReadCallback(ctx, fd.inode(), off, size, sizeRead, attributeVersion) // +checklocksforce: fd.inode() locks are held during fd operations.
-
-	// No bytes returned: offset >= EOF.
-	if len(outs) == 0 {
-		return nil, 0, io.EOF
 	}
 
 	return outs, sizeRead, nil
@@ -202,6 +215,9 @@ func (fs *filesystem) Write(ctx context.Context, fd *regularFileFD, offset int64
 			return n, offset, linuxerr.EIO
 		}
 
+		// Keep mapped pages coherent with write(2).
+		fd.inode().updateCache(uint64(offset), data[:out.Size])
+
 		n += int64(out.Size)
 		offset += int64(out.Size)
 		src = src.DropFirst64(int64(out.Size))
@@ -213,4 +229,41 @@ func (fs *filesystem) Write(ctx context.Context, fd *regularFileFD, offset int64
 		}
 	}
 	return n, offset, nil
+}
+
+// writeBytes writes data at off with fd's handle, for cache writeback.
+func (fs *filesystem) writeBytes(ctx context.Context, fd *regularFileFD, off uint64, data []byte) (int, error) {
+	maxWrite := uint32(fs.conn.maxPages) << hostarch.PageShift
+	if maxWrite > fs.conn.maxWrite {
+		maxWrite = fs.conn.maxWrite
+	}
+	if !fs.conn.bigWrites && maxWrite > hostarch.PageSize {
+		maxWrite = hostarch.PageSize
+	}
+	in := linux.FUSEWritePayloadIn{
+		Header: linux.FUSEWriteIn{
+			Fh:         fd.Fh,
+			WriteFlags: 1, // FUSE_WRITE_CACHE: delayed write from the page cache.
+			Flags:      fd.statusFlags(),
+		},
+	}
+	n := 0
+	for n < len(data) {
+		chunk := data[n:min(len(data), n+int(maxWrite))]
+		in.Header.Offset = off + uint64(n)
+		in.Header.Size = uint32(len(chunk))
+		in.Payload = chunk
+		out := linux.FUSEWriteOut{}
+		if err := fd.inode().call(ctx, linux.FUSE_WRITE, &in, &out); err != nil {
+			return n, err
+		}
+		if out.Size > uint32(len(chunk)) {
+			return n, linuxerr.EIO
+		}
+		n += int(out.Size)
+		if out.Size != uint32(len(chunk)) {
+			return n, linuxerr.EIO
+		}
+	}
+	return n, nil
 }

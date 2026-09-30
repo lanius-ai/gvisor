@@ -116,8 +116,13 @@ func (fd *DeviceFD) PRead(ctx context.Context, dst usermem.IOSequence, offset in
 func (fd *DeviceFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	if !fd.connected() {
+	if fd.conn == nil {
 		return 0, linuxerr.EPERM
+	}
+	if !fd.connected() {
+		// Aborted, e.g. unmounted: Linux's fuse_dev_do_read() returns ENODEV,
+		// which FUSE servers treat as a clean exit.
+		return 0, linuxerr.ENODEV
 	}
 	return fd.conn.read(ctx, dst)
 }

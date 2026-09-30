@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
@@ -98,6 +99,9 @@ type filesystem struct {
 
 	// clock is a real-time clock used to set timestamps in file operations.
 	clock ktime.Clock
+
+	// mf holds the page cache of memory-mapped regular files.
+	mf *pgalloc.MemoryFile `state:"nosave"`
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -218,6 +222,7 @@ func (fsType FilesystemType) getFilesystemHostFD(ctx context.Context, vfsObj *vf
 		opts:     fsopts,
 		conn:     conn,
 		clock:    ktime.RealtimeClockFromContext(ctx),
+		mf:       pgalloc.MemoryFileFromContext(ctx),
 	}
 	fs.VFSFilesystem().Init(vfsObj, &fsType, fs)
 
@@ -359,6 +364,7 @@ func newFUSEFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, fsTyp
 		opts:     opts,
 		conn:     fuseFD.conn,
 		clock:    ktime.RealtimeClockFromContext(ctx),
+		mf:       pgalloc.MemoryFileFromContext(ctx),
 	}
 	fs.VFSFilesystem().Init(vfsObj, fsType, fs)
 	return fs, nil
