@@ -15,6 +15,7 @@
 package fuse
 
 import (
+	"container/list"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -148,6 +149,42 @@ type inode struct {
 	//
 	// +checklocks:dataMu
 	writers []*regularFileFD
+
+	// retainedElem is i's element in fs.retained while its cache is retained
+	// unmapped, and retainedBytes the cache size counted for it in
+	// fs.retainedBytes. Both are protected by fs.retainMu.
+	retainedElem  *list.Element `state:"nosave"`
+	retainedBytes uint64        `state:"nosave"`
+
+	// The fields below cache a directory's listing (FOPEN_CACHE_DIR, see
+	// directory.go) and the names known to be absent from it. They aren't
+	// saved: a restored sandbox asks the server again.
+
+	// dirMu protects the directory caches. It is never held across a
+	// request to the server.
+	dirMu sync.Mutex `state:"nosave"`
+
+	// dirents is the directory's complete listing if direntsOK, read when
+	// the directory's mtime was direntsMtime.
+	//
+	// +checklocks:dirMu
+	dirents []vfs.Dirent `state:"nosave"`
+	// +checklocks:dirMu
+	direntsOK bool `state:"nosave"`
+	// +checklocks:dirMu
+	direntsMtime int64 `state:"nosave"`
+
+	// dirVersion counts changes to the directory's entries made through this
+	// filesystem, which drop the listing.
+	//
+	// +checklocks:dirMu
+	dirVersion uint64 `state:"nosave"`
+
+	// negative maps names that the server reported absent with a negative
+	// entry (a FUSE_LOOKUP reply with nodeid 0) to when that expires.
+	//
+	// +checklocks:dirMu
+	negative map[string]ktime.Time `state:"nosave"`
 }
 
 func (i *inode) Mode() linux.FileMode {
@@ -210,6 +247,7 @@ func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid 
 func (i *inode) DecRef(ctx context.Context) {
 	i.inodeRefs.DecRef(func() {
 		i.releaseCache()
+		i.dropDirCaches()
 		i.Destroy(ctx)
 	})
 }
@@ -598,12 +636,19 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 	}
 
 	fd.LockFD.Init(&i.locks)
-	// FOPEN_KEEP_CACHE is the default flag for noOpen.
+	isDir := i.filemode().IsDir()
+	// The defaults when no open request is sent, as Linux's fuse_file_open():
+	// keep the page cache and, for directories, cache the listing.
 	fd.OpenFlag = linux.FOPEN_KEEP_CACHE
+	if isDir {
+		fd.OpenFlag |= linux.FOPEN_CACHE_DIR
+	}
 
 	// An open request is sent unless the file handle was already returned by
-	// FUSE_CREATE, or the server does not support open for regular files.
-	willSendOpen := !i.fh.new && (!i.fs.conn.noOpen || i.filemode().IsDir())
+	// FUSE_CREATE, or the server does not support open (or opendir).
+	willSendOpen := !i.fh.new && ((!isDir && !i.fs.conn.noOpen) || (isDir && !i.fs.conn.noOpenDir.Load()))
+	// Without a server handle there is nothing to release.
+	fd.noRelease = !i.fh.new && !willSendOpen
 
 	truncateRegFile := opts.Flags&linux.O_TRUNC != 0 && i.filemode().FileType() == linux.S_IFREG
 	if truncateRegFile && !(willSendOpen && i.fs.conn.atomicOTrunc) {
@@ -631,8 +676,15 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 
 		out := linux.FUSEOpenOut{}
 		if err := i.call(ctx, opcode, &in, &out); err != nil {
-			if linuxerr.Equals(linuxerr.ENOSYS, err) && !i.filemode().IsDir() {
+			switch {
+			case linuxerr.Equals(linuxerr.ENOSYS, err) && isDir:
+				// As Linux, opendir of a server that doesn't implement it
+				// succeeds and is never sent again (FUSE_NO_OPENDIR_SUPPORT).
+				i.fs.conn.noOpenDir.Store(true)
+				fd.noRelease = true
+			case linuxerr.Equals(linuxerr.ENOSYS, err):
 				i.fs.conn.noOpen = true
+				fd.noRelease = true
 				// The open that was to carry O_TRUNC was refused; truncate with SETATTR.
 				if truncateRegFile && i.fs.conn.atomicOTrunc {
 					opts := vfs.SetStatOptions{Stat: linux.Statx{Size: 0, Mask: linux.STATX_SIZE}}
@@ -640,7 +692,7 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 						return nil, err
 					}
 				}
-			} else {
+			default:
 				return nil, err
 			}
 		} else {
@@ -722,8 +774,71 @@ func (i *inode) Valid(ctx context.Context, parent *kernfs.Dentry, name string) b
 
 // Lookup implements kernfs.Inode.Lookup.
 func (i *inode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
+	if i.knownAbsent(name) {
+		return nil, linuxerr.ENOENT
+	}
 	in := linux.FUSELookupIn{Name: linux.CString(name)}
-	return i.newEntry(ctx, name, 0, linux.FUSE_LOOKUP, &in)
+	var out linux.FUSEEntryOut
+	if err := i.call(ctx, linux.FUSE_LOOKUP, &in, &out); err != nil {
+		return nil, err
+	}
+	if out.NodeID == 0 {
+		// A negative entry: as Linux's fuse_lookup_name(), the name doesn't
+		// exist, and the server lets that be cached for entry_valid.
+		i.addAbsent(name, validTimeout(int64(out.EntryValid), int64(out.EntryValidNSec)))
+		return nil, linuxerr.ENOENT
+	}
+	return i.fs.newInode(ctx, out)
+}
+
+// maxNegativeEntries bounds the negative entries cached per filesystem.
+// ponytail: past it, absent names just aren't cached; Linux instead lets the
+// dcache shrinker reclaim negative dentries.
+const maxNegativeEntries = 1 << 16
+
+// knownAbsent reports whether name is cached as absent from directory i.
+func (i *inode) knownAbsent(name string) bool {
+	i.dirMu.Lock()
+	defer i.dirMu.Unlock()
+	expiry, ok := i.negative[name]
+	if !ok {
+		return false
+	}
+	if expiry.After(i.fs.clock.Now()) {
+		return true
+	}
+	delete(i.negative, name)
+	i.fs.negatives.Add(-1)
+	return false
+}
+
+// addAbsent caches name as absent from directory i for timeout.
+func (i *inode) addAbsent(name string, timeout ktime.Time) {
+	if timeout == ktime.ZeroTime {
+		return
+	}
+	i.dirMu.Lock()
+	defer i.dirMu.Unlock()
+	if _, ok := i.negative[name]; !ok {
+		if i.fs.negatives.Add(1) > maxNegativeEntries {
+			i.fs.negatives.Add(-1)
+			return
+		}
+	}
+	if i.negative == nil {
+		i.negative = make(map[string]ktime.Time)
+	}
+	i.negative[name] = i.fs.clock.Now().AddTime(timeout)
+}
+
+// dropDirCaches forgets directory i's cached listing and negative entries.
+func (i *inode) dropDirCaches() {
+	i.dirMu.Lock()
+	defer i.dirMu.Unlock()
+	i.dirVersion++
+	i.dirents, i.direntsOK = nil, false
+	i.fs.negatives.Add(-int64(len(i.negative)))
+	i.negative = nil
 }
 
 // Keep implements kernfs.Inode.Keep.
@@ -742,6 +857,7 @@ func (*inode) IterDirents(ctx context.Context, mnt *vfs.Mount, callback vfs.Iter
 
 // NewFile implements kernfs.Inode.NewFile.
 func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) (kernfs.Inode, error) {
+	defer i.dirChanged(name)
 	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC |
 		linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NONBLOCK | linux.O_NOCTTY
 	if !i.fs.conn.noCreate {
@@ -773,6 +889,7 @@ func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) 
 
 // NewNode implements kernfs.Inode.NewNode.
 func (i *inode) NewNode(ctx context.Context, name string, opts vfs.MknodOptions) (kernfs.Inode, error) {
+	defer i.dirChanged(name)
 	in := linux.FUSEMknodIn{
 		MknodMeta: linux.FUSEMknodMeta{
 			Mode:  uint32(opts.Mode),
@@ -786,6 +903,7 @@ func (i *inode) NewNode(ctx context.Context, name string, opts vfs.MknodOptions)
 
 // NewSymlink implements kernfs.Inode.NewSymlink.
 func (i *inode) NewSymlink(ctx context.Context, name, target string) (kernfs.Inode, error) {
+	defer i.dirChanged(name)
 	in := linux.FUSESymlinkIn{
 		Name:   linux.CString(name),
 		Target: linux.CString(target),
@@ -795,6 +913,8 @@ func (i *inode) NewSymlink(ctx context.Context, name, target string) (kernfs.Ino
 
 // NewLink implements kernfs.Inode.NewLink.
 func (i *inode) NewLink(ctx context.Context, name string, target kernfs.Inode) (kernfs.Inode, error) {
+	defer i.dirChanged(name)
+	defer target.(*inode).invalidateAttrs() // nlink, ctime
 	targetInode := target.(*inode)
 	in := linux.FUSELinkIn{
 		OldNodeID: primitive.Uint64(targetInode.nodeID),
@@ -805,12 +925,15 @@ func (i *inode) NewLink(ctx context.Context, name string, target kernfs.Inode) (
 
 // Unlink implements kernfs.Inode.Unlink.
 func (i *inode) Unlink(ctx context.Context, name string, child kernfs.Inode) error {
+	defer i.dirChanged(name)
+	defer child.(*inode).invalidateAttrs() // nlink, ctime
 	in := linux.FUSEUnlinkIn{Name: linux.CString(name)}
 	return i.callNoReply(ctx, linux.FUSE_UNLINK, &in)
 }
 
 // NewDir implements kernfs.Inode.NewDir.
 func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (kernfs.Inode, error) {
+	defer i.dirChanged(name)
 	in := linux.FUSEMkdirIn{
 		MkdirMeta: linux.FUSEMkdirMeta{
 			Mode:  uint32(opts.Mode),
@@ -823,6 +946,8 @@ func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) 
 
 // RmDir implements kernfs.Inode.RmDir.
 func (i *inode) RmDir(ctx context.Context, name string, child kernfs.Inode) error {
+	defer i.dirChanged(name)
+	defer child.(*inode).invalidateAttrs() // nlink, ctime
 	in := linux.FUSERmDirIn{Name: linux.CString(name)}
 	return i.callNoReply(ctx, linux.FUSE_RMDIR, &in)
 }
@@ -830,6 +955,9 @@ func (i *inode) RmDir(ctx context.Context, name string, child kernfs.Inode) erro
 // Rename implements kernfs.Inode.Rename.
 func (i *inode) Rename(ctx context.Context, oldname, newname string, child, dstDir kernfs.Inode) error {
 	dstDirInode := dstDir.(*inode)
+	defer i.dirChanged(oldname)
+	defer dstDirInode.dirChanged(newname)
+	defer child.(*inode).invalidateAttrs() // ctime
 	in := linux.FUSERenameIn{
 		Newdir:  primitive.Uint64(dstDirInode.nodeID),
 		Oldname: linux.CString(oldname),

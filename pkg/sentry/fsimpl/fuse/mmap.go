@@ -69,7 +69,10 @@ import (
 //   - An open reply without FOPEN_KEEP_CACHE writes back dirty pages, drops
 //     unmapped cached pages and rereads mapped clean pages in place (Linux's
 //     fuse_finish_open() => invalidate_inode_pages2()).
-//   - Unmapped cached pages are evictable (gofer's inode.Evict).
+//   - Pages of files that are no longer mapped stay cached up to retainBudget
+//     per filesystem, least recently unmapped evicted first; past it, and
+//     pages unmapped while other parts of the file stay mapped, are evictable
+//     (gofer's inode.Evict).
 //
 // The cache lives in the MemoryFile, which is saved with the sandbox, so
 // cached and dirty pages survive checkpoint/restore without talking to the
@@ -97,6 +100,17 @@ var (
 // Linux's filemap_fault() reads around a fault (ra_pages, which FUSE sets from
 // the negotiated max_readahead).
 const fillAround = fuseDefaultMaxReadahead
+
+// retainBudget bounds the cached pages a filesystem keeps for files that are
+// no longer mapped. runsc's MemoryFile evicts evictable pages as soon as its
+// releaser goroutine is idle (it gets no memory pressure signal), so without
+// retention every process that maps a file faults it in from the server
+// again: git reads its index, pack indexes and packs through mmap in each
+// process. Linux keeps such pages until memory pressure.
+//
+// ponytail: a fixed budget per mount, not memory pressure. Retained pages
+// count as the sandbox's page cache and are saved by checkpoints.
+const retainBudget = 128 << 20
 
 // wholeFile covers every page-aligned file offset.
 var wholeFile = memmap.MappableRange{Start: 0, End: hostarch.PageRoundDown(uint64(math.MaxInt64))}
@@ -128,6 +142,7 @@ func (fd *regularFileFD) AddMapping(ctx context.Context, ms memmap.MappingSpace,
 	i := fd.inode()
 	i.mapsMu.Lock()
 	defer i.mapsMu.Unlock()
+	i.fs.unretainCache(i)
 	mapped := i.mappings.AddMapping(ms, ar, offset, writable)
 	// As gofer's, Evict only drops unmapped pages, so that it needn't
 	// invalidate translations.
@@ -157,8 +172,64 @@ func (fd *regularFileFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpa
 		if err := i.writebackLocked(ctx, r); err != nil {
 			log.Warningf("fuse: writeback of unmapped range %v failed: %v", r, err)
 		}
+	}
+	if i.mappings.IsEmpty() {
+		i.fs.retainCache(i)
+		return
+	}
+	for _, r := range unmapped {
 		i.fs.mf.MarkEvictable(i, pgalloc.EvictableRange{Start: r.Start, End: r.End})
 	}
+}
+
+// retainCache keeps the cache of i, which is no longer mapped, for the next
+// mapper, making the least recently unmapped caches evictable past
+// retainBudget.
+//
+// Preconditions: i.mapsMu is locked; i.dataMu is not.
+func (fs *filesystem) retainCache(i *inode) {
+	i.dataMu.Lock()
+	var size uint64
+	for seg := i.cache.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
+		size += seg.Range().Length()
+	}
+	i.dataMu.Unlock()
+	var evict []*inode
+	fs.retainMu.Lock()
+	fs.unretainLocked(i)
+	if size != 0 {
+		i.retainedElem, i.retainedBytes = fs.retained.PushBack(i), size
+		fs.retainedBytes += size
+	}
+	for fs.retainedBytes > retainBudget {
+		t := fs.retained.Front().Value.(*inode)
+		fs.unretainLocked(t)
+		evict = append(evict, t)
+	}
+	fs.retainMu.Unlock()
+	// Evict drops only pages that are unmapped when it runs, so this needn't
+	// exclude a concurrent AddMapping of t.
+	for _, t := range evict {
+		fs.mf.MarkEvictable(t, pgalloc.EvictableRange{Start: wholeFile.Start, End: wholeFile.End})
+	}
+}
+
+// unretainCache stops counting i's cache as retained: i is mapped again or
+// is being destroyed.
+func (fs *filesystem) unretainCache(i *inode) {
+	fs.retainMu.Lock()
+	defer fs.retainMu.Unlock()
+	fs.unretainLocked(i)
+}
+
+// +checklocks:fs.retainMu
+func (fs *filesystem) unretainLocked(i *inode) {
+	if i.retainedElem == nil {
+		return
+	}
+	fs.retained.Remove(i.retainedElem)
+	fs.retainedBytes -= i.retainedBytes
+	i.retainedElem, i.retainedBytes = nil, 0
 }
 
 // CopyMapping implements memmap.Mappable.CopyMapping.
@@ -519,6 +590,7 @@ func (i *inode) releaseCache() {
 	if i.fs.mf == nil {
 		return
 	}
+	i.fs.unretainCache(i)
 	i.fs.mf.MarkAllUnevictable(i)
 	i.ioMu.Lock()
 	defer i.ioMu.Unlock()
