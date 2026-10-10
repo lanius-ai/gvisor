@@ -946,11 +946,15 @@ func (i *inode) RmDir(ctx context.Context, name string, child kernfs.Inode) erro
 }
 
 // Rename implements kernfs.Inode.Rename.
-func (i *inode) Rename(ctx context.Context, oldname, newname string, child, dstDir kernfs.Inode) error {
+func (i *inode) Rename(ctx context.Context, oldname, newname string, child, dstDir, replaced kernfs.Inode) error {
 	dstDirInode := dstDir.(*inode)
 	defer i.dirChanged(oldname)
 	defer dstDirInode.dirChanged(newname)
 	defer child.(*inode).invalidateAttrs() // ctime
+	if replaced != nil {
+		// nlink, ctime (Linux's fuse_rename_common() => fuse_entry_unlinked()).
+		defer replaced.(*inode).invalidateAttrs()
+	}
 	in := linux.FUSERenameIn{
 		Newdir:  primitive.Uint64(dstDirInode.nodeID),
 		Oldname: linux.CString(oldname),

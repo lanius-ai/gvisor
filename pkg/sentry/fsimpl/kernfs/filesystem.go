@@ -825,8 +825,10 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	var dstVFSD *vfs.Dentry
+	var dstInode Inode
 	if dst != nil {
 		dstVFSD = dst.VFSDentry()
+		dstInode = dst.inode
 	}
 
 	mntns := vfs.MountNamespaceFromContext(ctx)
@@ -847,7 +849,7 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err != nil {
 		return err
 	}
-	err = srcDir.inode.Rename(ctx, src.name, newName, src.inode, dstDir.inode)
+	err = srcDir.inode.Rename(ctx, src.name, newName, src.inode, dstDir.inode, dstInode)
 	if err != nil {
 		virtfs.AbortRenameDentry(&handle, srcVFSD, dstVFSD)
 		return err

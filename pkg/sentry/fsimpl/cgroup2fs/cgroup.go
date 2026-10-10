@@ -323,7 +323,7 @@ func (c *cgroup) RmDir(ctx context.Context, name string, child kernfs.Inode) err
 }
 
 // Rename implements kernfs.Inode.Rename.
-func (c *cgroup) Rename(ctx context.Context, oldname, newname string, child, dstDir kernfs.Inode) error {
+func (c *cgroup) Rename(ctx context.Context, oldname, newname string, child, dstDir, replaced kernfs.Inode) error {
 	return linuxerr.EPERM
 }
 

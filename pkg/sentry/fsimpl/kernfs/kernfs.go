@@ -850,13 +850,14 @@ type inodeDirectory interface {
 
 	// Rename is called on the source directory containing an inode being
 	// renamed. child points to the resolved child in the source directory.
-	// dstDir is guaranteed to be a directory inode.
+	// dstDir is guaranteed to be a directory inode. replaced is the inode
+	// that newname refers to in dstDir, which the rename replaces, or nil.
 	//
 	// On a successful call to Rename, the caller updates the dentry tree to
 	// reflect the name change.
 	//
 	// Precondition: Caller must serialize concurrent calls to Rename.
-	Rename(ctx context.Context, oldname, newname string, child, dstDir Inode) error
+	Rename(ctx context.Context, oldname, newname string, child, dstDir, replaced Inode) error
 
 	// Lookup should return an appropriate inode if name should resolve to a
 	// child of this directory inode. This gives the directory an opportunity
