@@ -16,13 +16,12 @@
 package fuse
 
 import (
-	"container/list"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"math"
 	"strconv"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
@@ -32,7 +31,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // Name is the default filesystem name.
@@ -108,18 +106,6 @@ type filesystem struct {
 
 	// negatives counts the negative entries cached in inode.negative.
 	negatives atomicbitops.Int64 `state:"nosave"`
-
-	// retainMu protects retained and retainedBytes; see mmap.go.
-	retainMu sync.Mutex `state:"nosave"`
-
-	// retained lists the inodes whose cache is retained although no mapping
-	// uses it, least recently unmapped first; retainedBytes is the sum of
-	// their inode.retainedBytes.
-	//
-	// +checklocks:retainMu
-	retained list.List `state:"nosave"`
-	// +checklocks:retainMu
-	retainedBytes uint64 `state:"nosave"`
 }
 
 // Name implements vfs.FilesystemType.Name.

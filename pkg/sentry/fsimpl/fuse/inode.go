@@ -15,7 +15,6 @@
 package fuse
 
 import (
-	"container/list"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -149,12 +148,6 @@ type inode struct {
 	//
 	// +checklocks:dataMu
 	writers []*regularFileFD
-
-	// retainedElem is i's element in fs.retained while its cache is retained
-	// unmapped, and retainedBytes the cache size counted for it in
-	// fs.retainedBytes. Both are protected by fs.retainMu.
-	retainedElem  *list.Element `state:"nosave"`
-	retainedBytes uint64        `state:"nosave"`
 
 	// The fields below cache a directory's listing (FOPEN_CACHE_DIR, see
 	// directory.go) and the names known to be absent from it. They aren't
