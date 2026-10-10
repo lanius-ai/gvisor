@@ -18,7 +18,7 @@ IMG=${IMG:-craypot-gvisor-harness}
 OUTER=debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 STRESS_SECS=${STRESS_SECS:-60}
 # RESULT lines each run must print; fewer means it died part way.
-declare -A EXPECT=([agentfs]=39 [bindfs]=41 [bindfs-kc]=41 [stress]=1 [cr]=12)
+declare -A EXPECT=([agentfs]=40 [bindfs]=42 [bindfs-kc]=42 [stress]=1 [cr]=12)
 R="/b/runsc --root /tmp/runsc --platform=systrap --overlay2=root:self --network=none --ignore-cgroups"
 
 as_root() { docker run --rm -v "$H:/h" "$OUTER" sh -c "$1"; }

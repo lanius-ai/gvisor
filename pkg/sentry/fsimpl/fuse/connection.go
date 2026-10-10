@@ -277,6 +277,14 @@ type connection struct {
 	noFlush    bool
 	noFsync    bool
 	noFsyncDir bool
+
+	// noGetXattr, noListXattr, noSetXattr and noRemoveXattr are set when the
+	// server answers the corresponding xattr request with ENOSYS; see
+	// inode.xattrCall.
+	noGetXattr    atomicbitops.Bool
+	noListXattr   atomicbitops.Bool
+	noSetXattr    atomicbitops.Bool
+	noRemoveXattr atomicbitops.Bool
 }
 
 func linuxError(err error) error {

@@ -47,6 +47,10 @@ func (conn *connection) StateFields() []string {
 		"noFlush",
 		"noFsync",
 		"noFsyncDir",
+		"noGetXattr",
+		"noListXattr",
+		"noSetXattr",
+		"noRemoveXattr",
 	}
 }
 
@@ -93,6 +97,10 @@ func (conn *connection) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(31, &conn.noFlush)
 	stateSinkObject.Save(32, &conn.noFsync)
 	stateSinkObject.Save(33, &conn.noFsyncDir)
+	stateSinkObject.Save(34, &conn.noGetXattr)
+	stateSinkObject.Save(35, &conn.noListXattr)
+	stateSinkObject.Save(36, &conn.noSetXattr)
+	stateSinkObject.Save(37, &conn.noRemoveXattr)
 }
 
 // +checklocksignore
@@ -129,6 +137,10 @@ func (conn *connection) StateLoad(ctx context.Context, stateSourceObject state.S
 	stateSourceObject.Load(31, &conn.noFlush)
 	stateSourceObject.Load(32, &conn.noFsync)
 	stateSourceObject.Load(33, &conn.noFsyncDir)
+	stateSourceObject.Load(34, &conn.noGetXattr)
+	stateSourceObject.Load(35, &conn.noListXattr)
+	stateSourceObject.Load(36, &conn.noSetXattr)
+	stateSourceObject.Load(37, &conn.noRemoveXattr)
 	stateSourceObject.LoadValue(2, new(bool), func(y any) { conn.loadInitializedChan(ctx, y.(bool)) })
 	stateSourceObject.LoadValue(4, new(int), func(y any) { conn.loadFullQueueCh(ctx, y.(int)) })
 	stateSourceObject.AfterLoad(func() { conn.afterLoad(ctx) })

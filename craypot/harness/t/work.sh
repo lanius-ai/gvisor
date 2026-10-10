@@ -39,6 +39,17 @@ cd $W/click 2>/dev/null && {
   chk git_log git log --oneline -3; chk git_gc git gc -q; chk git_fsck git fsck --no-progress
   chk git_checkout git checkout -q HEAD~1; chk git_status2 git status --short; cd $W; }
 
+# A server without xattr support must look like "no xattrs" (EOPNOTSUPP, as
+# Linux's fs/fuse/xattr.c), not ENOSYS: some ls/libacl builds print "Function
+# not implemented" for it (Debian's coreutils 9.7 stays quiet either way).
+chk xattr_no_enosys python3 -c "
+import errno, os, sys
+for f, a in ((os.listxattr, ()), (os.getxattr, ('user.a',)), (os.setxattr, ('user.a', b'v')), (os.removexattr, ('user.a',))):
+    try: f('$W', *a)
+    except OSError as e:
+        if e.errno == errno.ENOSYS: sys.exit(f.__name__ + ': ENOSYS')
+"
+
 # python venv + C extension (dlopen) + console script exec
 chk venv python3 -m venv $W/venv
 mkdir -p $W/ext && cat > $W/ext/hello.c <<'EOF'
