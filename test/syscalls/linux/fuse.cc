@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/capability.h>
 #include <linux/fuse.h>
@@ -34,6 +35,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -60,6 +64,7 @@
 
 using ::testing::AnyOf;
 using ::testing::Ge;
+using ::testing::UnorderedElementsAre;
 
 namespace gvisor {
 namespace testing {
@@ -218,6 +223,116 @@ TEST(FuseTest, CloneFromUnconnectedDeviceFails) {
   int fd1_num = fd1.get();
   EXPECT_THAT(ioctl(fd2.get(), FUSE_DEV_IOC_CLONE, &fd1_num),
               SyscallFailsWithErrno(EINVAL));
+}
+
+// kNoReply tells FuseServer not to answer a request (FORGET, INTERRUPT).
+constexpr ssize_t kNoReply = std::numeric_limits<ssize_t>::min();
+
+// A FUSE filesystem served by the test, which can count the requests the
+// kernel sends. Every request but FUSE_INIT goes to handle, which writes the
+// reply's payload to out and returns its length, a negative errno, or
+// kNoReply. Destruction unmounts it and stops the server.
+class FuseServer {
+ public:
+  using Handler = std::function<ssize_t(const fuse_in_header& in,
+                                        const char* in_payload, char* out)>;
+
+  static PosixErrorOr<std::unique_ptr<FuseServer>> Mount(Handler handle) {
+    auto s = std::unique_ptr<FuseServer>(new FuseServer());
+    s->handle_ = std::move(handle);
+    ASSIGN_OR_RETURN_ERRNO(s->fd_, Open("/dev/fuse", O_RDWR));
+    ASSIGN_OR_RETURN_ERRNO(s->mount_point_, TempPath::CreateDir());
+    const std::string opts = absl::StrFormat(
+        "fd=%d,user_id=0,group_id=0,rootmode=40755", s->fd_.get());
+    RETURN_ERROR_IF_SYSCALL_FAIL(mount("fuse", s->mount_point_.path().c_str(),
+                                       "fuse", MS_NODEV | MS_NOSUID,
+                                       opts.c_str()));
+    s->mounted_ = true;
+    FuseServer* raw = s.get();
+    s->thread_ = std::make_unique<ScopedThread>([raw] { raw->Serve(); });
+    return s;
+  }
+
+  ~FuseServer() {
+    if (mounted_) {
+      umount(mount_point_.path().c_str());  // The server reads ENODEV.
+    }
+    thread_.reset();
+  }
+
+  std::string Path(absl::string_view name) const {
+    return JoinPath(mount_point_.path(), name);
+  }
+
+ private:
+  FuseServer() = default;
+
+  void Serve() {
+    std::vector<char> req(FUSE_MIN_READ_BUFFER);
+    std::vector<char> resp(sizeof(fuse_out_header) + (1 << 20));
+    for (;;) {
+      ssize_t n = read(fd_.get(), req.data(), req.size());
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n < 0) {
+        return;  // ENODEV after umount.
+      }
+      auto* in = reinterpret_cast<fuse_in_header*>(req.data());
+      auto* out = reinterpret_cast<fuse_out_header*>(resp.data());
+      char* payload = resp.data() + sizeof(*out);
+      memset(resp.data(), 0, resp.size());
+      ssize_t len;
+      if (in->opcode == FUSE_INIT) {
+        auto* init = reinterpret_cast<fuse_init_out*>(payload);
+        init->major = FUSE_KERNEL_VERSION;
+        init->minor = FUSE_KERNEL_MINOR_VERSION;
+        len = sizeof(*init);
+      } else {
+        len = handle_(*in, req.data() + sizeof(*in), payload);
+      }
+      if (len == kNoReply) {
+        continue;
+      }
+      out->unique = in->unique;
+      if (len < 0) {
+        out->error = len;
+        len = 0;
+      }
+      out->len = sizeof(*out) + len;
+      write(fd_.get(), resp.data(), out->len);
+    }
+  }
+
+  FileDescriptor fd_;
+  TempPath mount_point_;
+  bool mounted_ = false;
+  Handler handle_;
+  std::unique_ptr<ScopedThread> thread_;
+};
+
+void FillAttr(fuse_attr* attr, uint64_t ino, mode_t mode, uint64_t size,
+              uint32_t nlink) {
+  attr->ino = ino;
+  attr->mode = mode;
+  attr->size = size;
+  attr->nlink = nlink;
+}
+
+ssize_t ReplyEntry(char* out, uint64_t nodeid, mode_t mode, uint64_t size) {
+  auto* entry = reinterpret_cast<fuse_entry_out*>(out);
+  entry->nodeid = nodeid;
+  entry->entry_valid = entry->attr_valid = 3600;
+  FillAttr(&entry->attr, nodeid, mode, size, S_ISDIR(mode) ? 2 : 1);
+  return sizeof(*entry);
+}
+
+ssize_t ReplyAttr(char* out, uint64_t nodeid, mode_t mode, uint64_t size,
+                  uint32_t nlink) {
+  auto* attr = reinterpret_cast<fuse_attr_out*>(out);
+  attr->attr_valid = 3600;
+  FillAttr(&attr->attr, nodeid, mode, size, nlink);
+  return sizeof(*attr);
 }
 
 TEST(FuseTest, LookupUpdatesInode) {
@@ -541,6 +656,238 @@ TEST(FuseTest, XattrENOSYSIsEOPNOTSUPPAndLatched) {
   EXPECT_EQ(listxattr_reqs, 1);
   EXPECT_EQ(setxattr_reqs, 1);
   EXPECT_EQ(removexattr_reqs, 1);
+}
+
+// A server that answers FUSE_OPENDIR with ENOSYS (FUSE_NO_OPENDIR_SUPPORT) is
+// sent no more OPENDIR or RELEASEDIR. As on Linux, such directories default
+// to FOPEN_CACHE_DIR: a listing is read from the server once and kept until a
+// change made through the mount.
+TEST(FuseTest, NoOpendirCachesListing) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;  // The server thread must not be paused by a save.
+  std::atomic<int> opendirs{0}, releasedirs{0}, readdirs{0};
+  std::atomic<bool> made_b{false};
+  auto server = ASSERT_NO_ERRNO_AND_VALUE(FuseServer::Mount(
+      [&](const fuse_in_header& in, const char* in_payload,
+          char* out) -> ssize_t {
+        switch (in.opcode) {
+          case FUSE_GETATTR:
+            return ReplyAttr(out, in.nodeid, S_IFDIR | 0755, 0, 2);
+          case FUSE_LOOKUP:
+            return -ENOENT;
+          case FUSE_MKDIR:
+            made_b = true;
+            return ReplyEntry(out, 3, S_IFDIR | 0755, 0);
+          case FUSE_OPENDIR:
+            opendirs++;
+            return -ENOSYS;
+          case FUSE_RELEASEDIR:
+            releasedirs++;
+            return 0;
+          case FUSE_READDIR: {
+            readdirs++;
+            std::vector<std::string> names = {".", "..", "a"};
+            if (made_b) {
+              names.push_back("b");
+            }
+            auto* read_in = reinterpret_cast<const fuse_read_in*>(in_payload);
+            size_t len = 0;
+            for (size_t i = read_in->offset; i < names.size(); i++) {
+              auto* d = reinterpret_cast<fuse_dirent*>(out + len);
+              d->ino = i + 1;
+              d->off = i + 1;
+              d->namelen = names[i].size();
+              d->type = names[i] == "a" ? DT_REG : DT_DIR;
+              memcpy(d->name, names[i].data(), names[i].size());
+              len += FUSE_DIRENT_SIZE(d);
+            }
+            return len;
+          }
+          case FUSE_ACCESS:
+            return 0;
+          case FUSE_FORGET:
+          case FUSE_BATCH_FORGET:
+          case FUSE_INTERRUPT:
+            return kNoReply;
+          default:
+            return -ENOSYS;
+        }
+      }));
+
+  for (int i = 0; i < 2; i++) {
+    EXPECT_THAT(ASSERT_NO_ERRNO_AND_VALUE(ListDir(server->Path(""), false)),
+                UnorderedElementsAre(".", "..", "a"));
+  }
+  EXPECT_EQ(opendirs, 1);
+  EXPECT_EQ(releasedirs, 0);
+  EXPECT_EQ(readdirs, 2);  // The entries, then the end of the directory.
+
+  ASSERT_THAT(mkdir(server->Path("b").c_str(), 0755), SyscallSucceeds());
+  EXPECT_THAT(ASSERT_NO_ERRNO_AND_VALUE(ListDir(server->Path(""), false)),
+              UnorderedElementsAre(".", "..", "a", "b"));
+  EXPECT_EQ(readdirs, 4);
+}
+
+// A FUSE_LOOKUP reply with nodeid 0 is a negative entry: as on Linux, the name
+// doesn't exist (ENOENT) and the kernel caches that for entry_valid, until the
+// name is created through the mount. An ENOENT reply is not cached.
+TEST(FuseTest, NegativeEntryCached) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;  // The server thread must not be paused by a save.
+  std::atomic<int> lookups_x{0}, lookups_y{0};
+  auto server = ASSERT_NO_ERRNO_AND_VALUE(FuseServer::Mount(
+      [&](const fuse_in_header& in, const char* in_payload,
+          char* out) -> ssize_t {
+        switch (in.opcode) {
+          case FUSE_GETATTR:
+            return ReplyAttr(out, in.nodeid, S_IFDIR | 0755, 0, 2);
+          case FUSE_LOOKUP:
+            if (std::string(in_payload) == "x") {
+              lookups_x++;
+              auto* entry = reinterpret_cast<fuse_entry_out*>(out);
+              entry->entry_valid = 3600;  // nodeid 0
+              return sizeof(*entry);
+            }
+            lookups_y++;
+            return -ENOENT;
+          case FUSE_MKDIR:
+            return ReplyEntry(out, 3, S_IFDIR | 0755, 0);
+          case FUSE_ACCESS:
+            return 0;
+          case FUSE_FORGET:
+          case FUSE_BATCH_FORGET:
+          case FUSE_INTERRUPT:
+            return kNoReply;
+          default:
+            return -ENOSYS;
+        }
+      }));
+
+  struct stat st;
+  for (int i = 0; i < 2; i++) {
+    EXPECT_THAT(stat(server->Path("x").c_str(), &st),
+                SyscallFailsWithErrno(ENOENT));
+    EXPECT_THAT(stat(server->Path("y").c_str(), &st),
+                SyscallFailsWithErrno(ENOENT));
+  }
+  EXPECT_EQ(lookups_x, 1);
+  EXPECT_EQ(lookups_y, 2);
+
+  ASSERT_THAT(mkdir(server->Path("x").c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(stat(server->Path("x").c_str(), &st), SyscallSucceeds());
+  EXPECT_TRUE(S_ISDIR(st.st_mode));
+  EXPECT_EQ(lookups_x, 1);
+}
+
+// A directory's attributes are fetched again after a change made through the
+// mount, as Linux's fuse_dir_changed() does, although attr_valid has not run
+// out.
+TEST(FuseTest, DirAttributesRefetchedAfterChange) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;  // The server thread must not be paused by a save.
+  std::atomic<int> getattrs{0};
+  std::atomic<bool> made_d{false};
+  auto server = ASSERT_NO_ERRNO_AND_VALUE(FuseServer::Mount(
+      [&](const fuse_in_header& in, const char* in_payload,
+          char* out) -> ssize_t {
+        switch (in.opcode) {
+          case FUSE_GETATTR:
+            getattrs++;
+            return ReplyAttr(out, in.nodeid, S_IFDIR | 0755, 0,
+                             in.nodeid == FUSE_ROOT_ID && made_d ? 3 : 2);
+          case FUSE_LOOKUP:
+            return -ENOENT;
+          case FUSE_MKDIR:
+            made_d = true;
+            return ReplyEntry(out, 3, S_IFDIR | 0755, 0);
+          case FUSE_ACCESS:
+            return 0;
+          case FUSE_FORGET:
+          case FUSE_BATCH_FORGET:
+          case FUSE_INTERRUPT:
+            return kNoReply;
+          default:
+            return -ENOSYS;
+        }
+      }));
+
+  const std::string root = server->Path("");
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(Stat(root)).st_nlink, 2);
+  const int before = getattrs;
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(Stat(root)).st_nlink, 2);
+  EXPECT_EQ(getattrs, before);  // attr_valid holds
+
+  ASSERT_THAT(mkdir(server->Path("d").c_str(), 0755), SyscallSucceeds());
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(Stat(root)).st_nlink, 3);
+}
+
+// Pages read through a mapping stay cached after the mapping and the file are
+// closed, so that mapping the file again reads nothing from the server, as
+// with Linux's page cache (runsc's MemoryFile evicts evictable pages as soon
+// as it is idle).
+TEST(FuseTest, UnmappedPagesStayCached) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;  // The server thread must not be paused by a save.
+  constexpr uint64_t kFileNode = 2;
+  const size_t kFileSize = 16 * kPageSize;
+  std::atomic<int> reads{0};
+  auto server = ASSERT_NO_ERRNO_AND_VALUE(FuseServer::Mount(
+      [&](const fuse_in_header& in, const char* in_payload,
+          char* out) -> ssize_t {
+        switch (in.opcode) {
+          case FUSE_LOOKUP:
+            return ReplyEntry(out, kFileNode, S_IFREG | 0644, kFileSize);
+          case FUSE_GETATTR:
+            if (in.nodeid == FUSE_ROOT_ID) {
+              return ReplyAttr(out, in.nodeid, S_IFDIR | 0755, 0, 2);
+            }
+            return ReplyAttr(out, in.nodeid, S_IFREG | 0644, kFileSize, 1);
+          case FUSE_OPEN: {
+            auto* open = reinterpret_cast<fuse_open_out*>(out);
+            open->fh = 1;
+            open->open_flags = FOPEN_KEEP_CACHE;
+            return sizeof(*open);
+          }
+          case FUSE_READ: {
+            reads++;
+            auto* read_in = reinterpret_cast<const fuse_read_in*>(in_payload);
+            size_t len = read_in->offset < kFileSize
+                             ? std::min<size_t>(read_in->size,
+                                                kFileSize - read_in->offset)
+                             : 0;
+            memset(out, 'x', len);
+            return len;
+          }
+          case FUSE_ACCESS:
+          case FUSE_FLUSH:
+          case FUSE_RELEASE:
+            return 0;
+          case FUSE_FORGET:
+          case FUSE_BATCH_FORGET:
+          case FUSE_INTERRUPT:
+            return kNoReply;
+          default:
+            return -ENOSYS;
+        }
+      }));
+
+  auto map_and_read = [&] {
+    const FileDescriptor file =
+        ASSERT_NO_ERRNO_AND_VALUE(Open(server->Path("file"), O_RDONLY));
+    Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+        Mmap(nullptr, kFileSize, PROT_READ, MAP_SHARED, file.get(), 0));
+    const volatile char* p = reinterpret_cast<const volatile char*>(m.ptr());
+    for (size_t off = 0; off < kFileSize; off += kPageSize) {
+      EXPECT_EQ(p[off], 'x') << off;
+    }
+  };
+  map_and_read();
+  const int first = reads;
+  EXPECT_GT(first, 0);
+  // Give an eviction time to happen.
+  absl::SleepFor(absl::Milliseconds(500));
+  map_and_read();
+  EXPECT_EQ(reads, first);
 }
 
 }  // namespace
