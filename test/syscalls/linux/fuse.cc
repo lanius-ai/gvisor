@@ -821,6 +821,43 @@ TEST(FuseTest, DirAttributesRefetchedAfterChange) {
   EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(Stat(root)).st_nlink, 3);
 }
 
+// st_ino is the inode number in the server's attributes, as on Linux, also
+// when it differs from the nodeid and the attributes come from the cache.
+TEST(FuseTest, StatReportsServerInodeNumber) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;  // The server thread must not be paused by a save.
+  constexpr uint64_t kIno = 77;
+  auto server = ASSERT_NO_ERRNO_AND_VALUE(FuseServer::Mount(
+      [&](const fuse_in_header& in, const char* in_payload,
+          char* out) -> ssize_t {
+        switch (in.opcode) {
+          case FUSE_LOOKUP: {
+            ssize_t len = ReplyEntry(out, 2, S_IFREG | 0644, 0);
+            reinterpret_cast<fuse_entry_out*>(out)->attr.ino = kIno;
+            return len;
+          }
+          case FUSE_GETATTR: {
+            ssize_t len = ReplyAttr(out, in.nodeid, S_IFDIR | 0755, 0, 2);
+            if (in.nodeid != FUSE_ROOT_ID) {
+              len = ReplyAttr(out, kIno, S_IFREG | 0644, 0, 1);
+            }
+            return len;
+          }
+          case FUSE_ACCESS:
+            return 0;
+          case FUSE_FORGET:
+          case FUSE_BATCH_FORGET:
+          case FUSE_INTERRUPT:
+            return kNoReply;
+          default:
+            return -ENOSYS;
+        }
+      }));
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(Stat(server->Path("f"))).st_ino, kIno);
+  }
+}
+
 // Pages read through a mapping stay cached after the mapping and the file are
 // closed, so that mapping the file again reads nothing from the server, as
 // with Linux's page cache (runsc's MemoryFile evicts evictable pages as soon
