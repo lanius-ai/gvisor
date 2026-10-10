@@ -15,7 +15,7 @@ case $MODE in
 bindfs) bindfs /srv/b $W; B=/srv/b ;;
 bindfs-kc) bindfs -o kernel_cache /srv/b $W; B=/srv/b ;;
 agentfs) mkdir -p /var/lib/agentfs && cd /var/lib/agentfs && agentfs init ws >/dev/null && cd / \
-  && (agentfs mount /var/lib/agentfs/.agentfs/ws.db $W --foreground --system >/var/log/agentfs.log 2>&1 &) \
+  && (RUST_LOG=agentfs::fuse=debug agentfs mount /var/lib/agentfs/.agentfs/ws.db $W --foreground --system >/var/log/agentfs.log 2>&1 &) \
   && for i in $(seq 50); do mountpoint -q $W && break; sleep 0.1; done ;;
 rootfs) ;;
 esac
@@ -38,6 +38,16 @@ cd $W/click 2>/dev/null && {
   echo "# change" >> README.md; chk git_add git add -A; chk git_commit git commit -qm change
   chk git_log git log --oneline -3; chk git_gc git gc -q; chk git_fsck git fsck --no-progress
   chk git_checkout git checkout -q HEAD~1; chk git_status2 git status --short; cd $W; }
+
+# Metadata caches (agentfs answers opendir ENOSYS and replies negative
+# entries): a warm git status reads no listing and looks up no absent name.
+# git creates and deletes index.lock in each run, so its lookup is expected.
+if [ "$MODE" = agentfs ]; then
+  dirreqs() { grep -E 'FUSE::(opendir|readdir|lookup)' /var/log/agentfs.log | grep -vc 'name="index.lock"'; }
+  git -C $W/click status --short >/dev/null; n0=$(dirreqs)
+  git -C $W/click status --short >/dev/null; n1=$(dirreqs)
+  [ "$n1" = "$n0" ] && res warm_git_status_cached PASS || res warm_git_status_cached FAIL "$((n1 - n0)) OPENDIR/READDIR/LOOKUP requests"
+fi
 
 # A server without xattr support must look like "no xattrs" (EOPNOTSUPP, as
 # Linux's fs/fuse/xattr.c), not ENOSYS: some ls/libacl builds print "Function

@@ -6,8 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       bindfs fuse3 cargo rustc procps psmisc util-linux \
  && rm -rf /var/lib/apt/lists/*
 # The AgentFS craypot runs (github.com/lanius-ai/agentfs release, static musl).
-ADD --chmod=755 --checksum=sha256:3e1bce513bc55a2d9535ff5dd2a4f6e255f98fb1c9c1897f4a91ac30a2292bee \
-    https://github.com/lanius-ai/agentfs/releases/download/craypot-20260930-62ac3c7/agentfs-x86_64-unknown-linux-musl /usr/local/bin/agentfs
+ADD --chmod=755 --checksum=sha256:32a6fbc4348b9ab32ca3a6d8620714e8e70c6641326b6785697b16c347bc6312 \
+    https://github.com/lanius-ai/agentfs/releases/download/craypot-20261010-86c5b38/agentfs-x86_64-unknown-linux-musl /usr/local/bin/agentfs
 RUN git config --system user.name t && git config --system user.email t@example.invalid \
  && git config --system init.defaultBranch main && git config --system safe.directory '*' \
  && git clone -q --branch 8.1.8 https://github.com/pallets/click /opt/click
