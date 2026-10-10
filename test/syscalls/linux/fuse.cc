@@ -858,6 +858,62 @@ TEST(FuseTest, StatReportsServerInodeNumber) {
   }
 }
 
+// Renaming a file over another drops the replaced file's cached attributes,
+// as Linux's fuse_rename_common() => fuse_entry_unlinked() does: a file
+// descriptor on the replaced file reports nlink 0 although attr_valid has not
+// run out.
+TEST(FuseTest, RenameOverRefetchesReplacedAttributes) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;  // The server thread must not be paused by a save.
+  constexpr uint64_t kSrcNode = 2, kDstNode = 3;
+  std::atomic<bool> renamed{false};
+  auto server = ASSERT_NO_ERRNO_AND_VALUE(FuseServer::Mount(
+      [&](const fuse_in_header& in, const char* in_payload,
+          char* out) -> ssize_t {
+        switch (in.opcode) {
+          case FUSE_LOOKUP:
+            if (std::string(in_payload) == "src") {
+              return ReplyEntry(out, kSrcNode, S_IFREG | 0644, 0);
+            }
+            if (std::string(in_payload) == "dst") {
+              return ReplyEntry(out, kDstNode, S_IFREG | 0644, 0);
+            }
+            return -ENOENT;
+          case FUSE_GETATTR:
+            if (in.nodeid == FUSE_ROOT_ID) {
+              return ReplyAttr(out, in.nodeid, S_IFDIR | 0755, 0, 2);
+            }
+            return ReplyAttr(out, in.nodeid, S_IFREG | 0644, 0,
+                             in.nodeid == kDstNode && renamed ? 0 : 1);
+          case FUSE_OPEN: {
+            auto* open = reinterpret_cast<fuse_open_out*>(out);
+            open->fh = 1;
+            return sizeof(*open);
+          }
+          case FUSE_RENAME:
+            renamed = true;
+            return 0;
+          case FUSE_ACCESS:
+          case FUSE_FLUSH:
+          case FUSE_RELEASE:
+            return 0;
+          case FUSE_FORGET:
+          case FUSE_BATCH_FORGET:
+          case FUSE_INTERRUPT:
+            return kNoReply;
+          default:
+            return -ENOSYS;
+        }
+      }));
+
+  const FileDescriptor dst =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(server->Path("dst"), O_RDONLY));
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(Fstat(dst.get())).st_nlink, 1);
+  ASSERT_THAT(rename(server->Path("src").c_str(), server->Path("dst").c_str()),
+              SyscallSucceeds());
+  EXPECT_EQ(ASSERT_NO_ERRNO_AND_VALUE(Fstat(dst.get())).st_nlink, 0);
+}
+
 }  // namespace
 }  // namespace testing
 }  // namespace gvisor
