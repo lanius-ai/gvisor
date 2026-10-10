@@ -211,11 +211,16 @@ func direntsFrom(ents []vfs.Dirent, off int64) (int, bool) {
 	return 0, false
 }
 
-// dirChanged drops the listing cache after a change to the directory's
-// entries made through this filesystem (Linux's fuse_dir_changed()).
-func (i *inode) dirChanged() {
+// dirChanged drops the listing cache and any negative entry for name after
+// a change to the directory's entry name made through this filesystem
+// (Linux's fuse_dir_changed() and d_instantiate()).
+func (i *inode) dirChanged(name string) {
 	i.dirMu.Lock()
+	defer i.dirMu.Unlock()
 	i.dirVersion++
 	i.dirents, i.direntsOK = nil, false
-	i.dirMu.Unlock()
+	if _, ok := i.negative[name]; ok {
+		delete(i.negative, name)
+		i.fs.negatives.Add(-1)
+	}
 }

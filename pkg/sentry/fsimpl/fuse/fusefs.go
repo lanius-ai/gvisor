@@ -16,6 +16,7 @@
 package fuse
 
 import (
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"math"
 	"strconv"
 
@@ -102,6 +103,9 @@ type filesystem struct {
 
 	// mf holds the page cache of memory-mapped regular files.
 	mf *pgalloc.MemoryFile `state:"nosave"`
+
+	// negatives counts the negative entries cached in inode.negative.
+	negatives atomicbitops.Int64 `state:"nosave"`
 }
 
 // Name implements vfs.FilesystemType.Name.
