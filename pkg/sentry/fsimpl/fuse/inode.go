@@ -962,11 +962,8 @@ func (i *inode) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string,
 		Name: linux.CString(opts.Name),
 	}
 
-	res, err := i.callRaw(ctx, linux.FUSE_GETXATTR, &in)
+	res, err := i.xattrCall(ctx, linux.FUSE_GETXATTR, &i.fs.conn.noGetXattr, &in)
 	if err != nil {
-		return "", err
-	}
-	if err := res.Error(); err != nil {
 		return "", err
 	}
 
@@ -996,7 +993,8 @@ func (i *inode) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 		Value: []byte(opts.Value),
 	}
 
-	return i.callNoReply(ctx, linux.FUSE_SETXATTR, &in)
+	_, err := i.xattrCall(ctx, linux.FUSE_SETXATTR, &i.fs.conn.noSetXattr, &in)
+	return err
 }
 
 // ListXattr implements kernfs.InodeWithXattrs.ListXattr.
@@ -1005,11 +1003,8 @@ func (i *inode) ListXattr(ctx context.Context, size uint64) ([]string, error) {
 		Size: uint32(size),
 	}
 
-	res, err := i.callRaw(ctx, linux.FUSE_LISTXATTR, &in)
+	res, err := i.xattrCall(ctx, linux.FUSE_LISTXATTR, &i.fs.conn.noListXattr, &in)
 	if err != nil {
-		return nil, err
-	}
-	if err := res.Error(); err != nil {
 		return nil, err
 	}
 
@@ -1054,5 +1049,29 @@ func (i *inode) ListXattr(ctx context.Context, size uint64) ([]string, error) {
 // RemoveXattr implements kernfs.InodeWithXattrs.RemoveXattr.
 func (i *inode) RemoveXattr(ctx context.Context, name string) error {
 	in := linux.CString(name)
-	return i.callNoReply(ctx, linux.FUSE_REMOVEXATTR, &in)
+	_, err := i.xattrCall(ctx, linux.FUSE_REMOVEXATTR, &i.fs.conn.noRemoveXattr, &in)
+	return err
+}
+
+// xattrCall sends an xattr request and returns its successful reply. As in
+// Linux's fs/fuse/xattr.c, a server that answers ENOSYS doesn't support the
+// request: it is reported as EOPNOTSUPP, which tools such as ls and libacl
+// treat as "no xattrs", and latched in *unsupported so that it isn't sent
+// again.
+func (i *inode) xattrCall(ctx context.Context, opcode linux.FUSEOpcode, unsupported *atomicbitops.Bool, in marshal.Marshallable) (*Response, error) {
+	if unsupported.Load() {
+		return nil, linuxerr.EOPNOTSUPP
+	}
+	res, err := i.callRaw(ctx, opcode, in)
+	if err != nil {
+		return nil, err
+	}
+	if err := res.Error(); err != nil {
+		if linuxerr.Equals(linuxerr.ENOSYS, err) {
+			unsupported.Store(true)
+			return nil, linuxerr.EOPNOTSUPP
+		}
+		return nil, err
+	}
+	return res, nil
 }

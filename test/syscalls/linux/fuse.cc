@@ -25,6 +25,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -57,6 +58,7 @@
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
+using ::testing::AnyOf;
 using ::testing::Ge;
 
 namespace gvisor {
@@ -443,6 +445,102 @@ TEST(FuseTest, MmapFaultInterruptedBySignal) {
     EXPECT_EQ(got, 'x');
     EXPECT_EQ(signals, 1);
   }
+}
+
+// A server without xattr support answers xattr requests with ENOSYS. Like
+// Linux's fs/fuse/xattr.c, that is reported as EOPNOTSUPP (which ls and
+// libacl treat as "no xattrs") and latched per request type, so later calls
+// send no request.
+TEST(FuseTest, XattrENOSYSIsEOPNOTSUPPAndLatched) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  const DisableSave ds;  // The server thread must not be paused by a save.
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/fuse", O_RDWR));
+  auto mount_point = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto mount_opts =
+      absl::StrFormat("fd=%d,user_id=0,group_id=0,rootmode=40755", fd.get());
+  ASSERT_THAT(mount("fuse", mount_point.path().c_str(), "fuse",
+                    MS_NODEV | MS_NOSUID, mount_opts.c_str()),
+              SyscallSucceeds());
+  FuseInit(fd.get());
+
+  std::atomic<int> getxattr_reqs{0}, listxattr_reqs{0}, setxattr_reqs{0},
+      removexattr_reqs{0};
+  ScopedThread server([&] {
+    std::vector<char> req(FUSE_MIN_READ_BUFFER);
+    for (;;) {
+      ssize_t n = read(fd.get(), req.data(), req.size());
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n < 0) {
+        return;  // ENODEV after umount.
+      }
+      auto* in = reinterpret_cast<fuse_in_header*>(req.data());
+      struct {
+        fuse_out_header hdr;
+        fuse_attr_out attr;
+      } resp = {};
+      resp.hdr.unique = in->unique;
+      resp.hdr.len = sizeof(resp.hdr);
+      switch (in->opcode) {
+        case FUSE_GETATTR:
+          resp.attr.attr_valid = 3600;
+          resp.attr.attr.ino = in->nodeid;
+          resp.attr.attr.mode = S_IFDIR | 0755;
+          resp.attr.attr.nlink = 2;
+          resp.hdr.len = sizeof(resp);
+          break;
+        case FUSE_ACCESS:
+          break;
+        case FUSE_GETXATTR:
+          getxattr_reqs++;
+          resp.hdr.error = -ENOSYS;
+          break;
+        case FUSE_LISTXATTR:
+          listxattr_reqs++;
+          resp.hdr.error = -ENOSYS;
+          break;
+        case FUSE_SETXATTR:
+          setxattr_reqs++;
+          resp.hdr.error = -ENOSYS;
+          break;
+        case FUSE_REMOVEXATTR:
+          removexattr_reqs++;
+          resp.hdr.error = -ENOSYS;
+          break;
+        case FUSE_FORGET:
+        case FUSE_BATCH_FORGET:
+        case FUSE_INTERRUPT:
+          continue;  // No reply.
+        default:
+          resp.hdr.error = -ENOSYS;
+      }
+      write(fd.get(), &resp, resp.hdr.len);
+    }
+  });
+  // Stops the server, also if an assertion fails.
+  Cleanup unmount([&] { umount(mount_point.path().c_str()); });
+
+  const char* path = mount_point.path().c_str();
+  char buf[64];
+  for (int i = 0; i < 2; i++) {
+    EXPECT_THAT(getxattr(path, "user.a", buf, sizeof(buf)),
+                SyscallFailsWithErrno(EOPNOTSUPP));
+    // gVisor's VFS, unlike Linux's fuse_listxattr(), reports EOPNOTSUPP from
+    // listxattr as an empty list.
+    EXPECT_THAT(listxattr(path, buf, sizeof(buf)),
+                AnyOf(SyscallSucceedsWithValue(0),
+                      SyscallFailsWithErrno(EOPNOTSUPP)));
+    EXPECT_THAT(setxattr(path, "user.a", "v", 1, 0),
+                SyscallFailsWithErrno(EOPNOTSUPP));
+    EXPECT_THAT(removexattr(path, "user.a"),
+                SyscallFailsWithErrno(EOPNOTSUPP));
+  }
+  EXPECT_EQ(getxattr_reqs, 1);
+  EXPECT_EQ(listxattr_reqs, 1);
+  EXPECT_EQ(setxattr_reqs, 1);
+  EXPECT_EQ(removexattr_reqs, 1);
 }
 
 }  // namespace
