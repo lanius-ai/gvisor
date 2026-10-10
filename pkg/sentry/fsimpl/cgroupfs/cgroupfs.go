@@ -588,7 +588,7 @@ func (d *dir) newDirWithOwner(ctx context.Context, ownerCreds *auth.Credentials,
 // Rename implements kernfs.Inode.Rename. Cgroupfs only allows renaming of
 // cgroup directories, and the rename may only change the name within the same
 // parent. See linux, kernel/cgroup.c:cgroup_rename().
-func (d *dir) Rename(ctx context.Context, oldname, newname string, child, dst kernfs.Inode) error {
+func (d *dir) Rename(ctx context.Context, oldname, newname string, child, dst, replaced kernfs.Inode) error {
 	if _, ok := child.(*cgroupInode); !ok {
 		// Not a cgroup directory. Control files are backed by different types.
 		return linuxerr.ENOTDIR
@@ -609,7 +609,7 @@ func (d *dir) Rename(ctx context.Context, oldname, newname string, child, dst ke
 	}
 
 	// Rename moves oldname to newname within d. Proceed.
-	return d.OrderedChildren.Rename(ctx, oldname, newname, child, dst)
+	return d.OrderedChildren.Rename(ctx, oldname, newname, child, dst, replaced)
 }
 
 // Unlink implements kernfs.Inode.Unlink. Cgroupfs disallows unlink, as the only

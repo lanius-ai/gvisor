@@ -70,7 +70,7 @@ func (i *rootInode) DecRef(ctx context.Context) {
 
 // Rename implements Inode.Rename and overrides OrderedChildren.Rename. mqueue
 // filesystem allows files to be unlinked, but not renamed.
-func (i *rootInode) Rename(ctx context.Context, oldname, newname string, child, dstDir kernfs.Inode) error {
+func (i *rootInode) Rename(ctx context.Context, oldname, newname string, child, dstDir, replaced kernfs.Inode) error {
 	return linuxerr.EPERM
 }
 

@@ -135,7 +135,7 @@ func (InodeNotDirectory) RmDir(context.Context, string, Inode) error {
 }
 
 // Rename implements Inode.Rename.
-func (InodeNotDirectory) Rename(context.Context, string, string, Inode, Inode) error {
+func (InodeNotDirectory) Rename(context.Context, string, string, Inode, Inode, Inode) error {
 	panic("Rename called on non-directory inode")
 }
 
@@ -645,7 +645,7 @@ func (o *OrderedChildren) RmDir(ctx context.Context, name string, child Inode) e
 // that will support Rename.
 //
 // Postcondition: reference on any replaced dentry transferred to caller.
-func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, child, dstDir Inode) error {
+func (o *OrderedChildren) Rename(ctx context.Context, oldname, newname string, child, dstDir, replaced Inode) error {
 	if !o.writable {
 		return linuxerr.EPERM
 	}
