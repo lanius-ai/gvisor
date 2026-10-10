@@ -347,7 +347,7 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 func (i *inode) getFUSEAttr() linux.FUSEAttr {
 	ns := time.Second.Nanoseconds()
 	return linux.FUSEAttr{
-		Ino:       i.nodeID,
+		Ino:       i.ino.Load(),
 		UID:       i.uid.Load(),
 		GID:       i.gid.Load(),
 		Size:      i.size.Load(),
