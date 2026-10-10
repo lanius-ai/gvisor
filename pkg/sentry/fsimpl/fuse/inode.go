@@ -907,6 +907,7 @@ func (i *inode) NewSymlink(ctx context.Context, name, target string) (kernfs.Ino
 // NewLink implements kernfs.Inode.NewLink.
 func (i *inode) NewLink(ctx context.Context, name string, target kernfs.Inode) (kernfs.Inode, error) {
 	defer i.dirChanged(name)
+	defer target.(*inode).invalidateAttrs() // nlink, ctime
 	targetInode := target.(*inode)
 	in := linux.FUSELinkIn{
 		OldNodeID: primitive.Uint64(targetInode.nodeID),
@@ -918,6 +919,7 @@ func (i *inode) NewLink(ctx context.Context, name string, target kernfs.Inode) (
 // Unlink implements kernfs.Inode.Unlink.
 func (i *inode) Unlink(ctx context.Context, name string, child kernfs.Inode) error {
 	defer i.dirChanged(name)
+	defer child.(*inode).invalidateAttrs() // nlink, ctime
 	in := linux.FUSEUnlinkIn{Name: linux.CString(name)}
 	return i.callNoReply(ctx, linux.FUSE_UNLINK, &in)
 }
@@ -938,6 +940,7 @@ func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) 
 // RmDir implements kernfs.Inode.RmDir.
 func (i *inode) RmDir(ctx context.Context, name string, child kernfs.Inode) error {
 	defer i.dirChanged(name)
+	defer child.(*inode).invalidateAttrs() // nlink, ctime
 	in := linux.FUSERmDirIn{Name: linux.CString(name)}
 	return i.callNoReply(ctx, linux.FUSE_RMDIR, &in)
 }
@@ -947,6 +950,7 @@ func (i *inode) Rename(ctx context.Context, oldname, newname string, child, dstD
 	dstDirInode := dstDir.(*inode)
 	defer i.dirChanged(oldname)
 	defer dstDirInode.dirChanged(newname)
+	defer child.(*inode).invalidateAttrs() // ctime
 	in := linux.FUSERenameIn{
 		Newdir:  primitive.Uint64(dstDirInode.nodeID),
 		Oldname: linux.CString(oldname),

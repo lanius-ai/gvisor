@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -211,10 +212,11 @@ func direntsFrom(ents []vfs.Dirent, off int64) (int, bool) {
 	return 0, false
 }
 
-// dirChanged drops the listing cache and any negative entry for name after
-// a change to the directory's entry name made through this filesystem
-// (Linux's fuse_dir_changed() and d_instantiate()).
+// dirChanged drops the listing cache, any negative entry for name and the
+// directory's attributes (mtime, ctime, nlink) after a change to its entry
+// name made through this filesystem (Linux's fuse_dir_changed()).
 func (i *inode) dirChanged(name string) {
+	i.invalidateAttrs()
 	i.dirMu.Lock()
 	defer i.dirMu.Unlock()
 	i.dirVersion++
@@ -223,4 +225,12 @@ func (i *inode) dirChanged(name string) {
 		delete(i.negative, name)
 		i.fs.negatives.Add(-1)
 	}
+}
+
+// invalidateAttrs makes the next stat fetch i's attributes from the server
+// (Linux's fuse_invalidate_attr()).
+func (i *inode) invalidateAttrs() {
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	i.attrTime = ktime.ZeroTime
 }
