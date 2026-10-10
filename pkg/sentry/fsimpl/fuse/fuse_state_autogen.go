@@ -43,6 +43,7 @@ func (conn *connection) StateFields() []string {
 		"bigWrites",
 		"dontMask",
 		"noOpen",
+		"noOpenDir",
 		"noCreate",
 		"noFlush",
 		"noFsync",
@@ -93,14 +94,15 @@ func (conn *connection) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(27, &conn.bigWrites)
 	stateSinkObject.Save(28, &conn.dontMask)
 	stateSinkObject.Save(29, &conn.noOpen)
-	stateSinkObject.Save(30, &conn.noCreate)
-	stateSinkObject.Save(31, &conn.noFlush)
-	stateSinkObject.Save(32, &conn.noFsync)
-	stateSinkObject.Save(33, &conn.noFsyncDir)
-	stateSinkObject.Save(34, &conn.noGetXattr)
-	stateSinkObject.Save(35, &conn.noListXattr)
-	stateSinkObject.Save(36, &conn.noSetXattr)
-	stateSinkObject.Save(37, &conn.noRemoveXattr)
+	stateSinkObject.Save(30, &conn.noOpenDir)
+	stateSinkObject.Save(31, &conn.noCreate)
+	stateSinkObject.Save(32, &conn.noFlush)
+	stateSinkObject.Save(33, &conn.noFsync)
+	stateSinkObject.Save(34, &conn.noFsyncDir)
+	stateSinkObject.Save(35, &conn.noGetXattr)
+	stateSinkObject.Save(36, &conn.noListXattr)
+	stateSinkObject.Save(37, &conn.noSetXattr)
+	stateSinkObject.Save(38, &conn.noRemoveXattr)
 }
 
 // +checklocksignore
@@ -133,14 +135,15 @@ func (conn *connection) StateLoad(ctx context.Context, stateSourceObject state.S
 	stateSourceObject.Load(27, &conn.bigWrites)
 	stateSourceObject.Load(28, &conn.dontMask)
 	stateSourceObject.Load(29, &conn.noOpen)
-	stateSourceObject.Load(30, &conn.noCreate)
-	stateSourceObject.Load(31, &conn.noFlush)
-	stateSourceObject.Load(32, &conn.noFsync)
-	stateSourceObject.Load(33, &conn.noFsyncDir)
-	stateSourceObject.Load(34, &conn.noGetXattr)
-	stateSourceObject.Load(35, &conn.noListXattr)
-	stateSourceObject.Load(36, &conn.noSetXattr)
-	stateSourceObject.Load(37, &conn.noRemoveXattr)
+	stateSourceObject.Load(30, &conn.noOpenDir)
+	stateSourceObject.Load(31, &conn.noCreate)
+	stateSourceObject.Load(32, &conn.noFlush)
+	stateSourceObject.Load(33, &conn.noFsync)
+	stateSourceObject.Load(34, &conn.noFsyncDir)
+	stateSourceObject.Load(35, &conn.noGetXattr)
+	stateSourceObject.Load(36, &conn.noListXattr)
+	stateSourceObject.Load(37, &conn.noSetXattr)
+	stateSourceObject.Load(38, &conn.noRemoveXattr)
 	stateSourceObject.LoadValue(2, new(bool), func(y any) { conn.loadInitializedChan(ctx, y.(bool)) })
 	stateSourceObject.LoadValue(4, new(int), func(y any) { conn.loadFullQueueCh(ctx, y.(int)) })
 	stateSourceObject.AfterLoad(func() { conn.afterLoad(ctx) })
@@ -267,6 +270,7 @@ func (fd *fileDescription) StateFields() []string {
 		"Nonseekable",
 		"DirectIO",
 		"OpenFlag",
+		"noRelease",
 		"off",
 	}
 }
@@ -284,7 +288,8 @@ func (fd *fileDescription) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(5, &fd.Nonseekable)
 	stateSinkObject.Save(6, &fd.DirectIO)
 	stateSinkObject.Save(7, &fd.OpenFlag)
-	stateSinkObject.Save(8, &fd.off)
+	stateSinkObject.Save(8, &fd.noRelease)
+	stateSinkObject.Save(9, &fd.off)
 }
 
 func (fd *fileDescription) afterLoad(context.Context) {}
@@ -299,7 +304,8 @@ func (fd *fileDescription) StateLoad(ctx context.Context, stateSourceObject stat
 	stateSourceObject.Load(5, &fd.Nonseekable)
 	stateSourceObject.Load(6, &fd.DirectIO)
 	stateSourceObject.Load(7, &fd.OpenFlag)
-	stateSourceObject.Load(8, &fd.off)
+	stateSourceObject.Load(8, &fd.noRelease)
+	stateSourceObject.Load(9, &fd.off)
 }
 
 func (fsType *FilesystemType) StateTypeName() string {

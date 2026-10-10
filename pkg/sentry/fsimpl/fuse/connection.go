@@ -104,7 +104,6 @@ type connection struct {
 	//	- FUSE_POSIX_ACL: affects defaultPermissions, posixACL, xattr handler (7.26)
 	//	- FUSE_ABORT_ERROR (7.27)
 	//	- FUSE_CACHE_SYMLINKS (7.28)
-	//	- FUSE_NO_OPENDIR_SUPPORT (7.29)
 	//	- FUSE_EXPLICIT_INVAL_DATA: requires page caching eviction (7.30)
 	//	- FUSE_MAP_ALIGNMENT (7.31)
 
@@ -266,6 +265,11 @@ type connection struct {
 	// noOpen if FUSE server doesn't support open operation.
 	// This flag only influences performance, not correctness of the program.
 	noOpen bool
+
+	// noOpenDir is set when the server answers FUSE_OPENDIR with ENOSYS
+	// (FUSE_NO_OPENDIR_SUPPORT). Like Linux, directories are then opened
+	// without a request, with FOPEN_KEEP_CACHE|FOPEN_CACHE_DIR.
+	noOpenDir atomicbitops.Bool
 
 	// noCreate if FUSE server doesn't support the create operation. Files are
 	// then created with FUSE_MKNOD followed by FUSE_OPEN, as Linux does.

@@ -148,6 +148,29 @@ type inode struct {
 	//
 	// +checklocks:dataMu
 	writers []*regularFileFD
+
+	// The fields below cache a directory's listing (FOPEN_CACHE_DIR); see
+	// directory.go. They aren't saved: a restored sandbox rereads listings.
+
+	// dirMu protects the listing cache. It is never held across a request
+	// to the server.
+	dirMu sync.Mutex `state:"nosave"`
+
+	// dirents is the directory's complete listing if direntsOK, read when
+	// the directory's mtime was direntsMtime.
+	//
+	// +checklocks:dirMu
+	dirents []vfs.Dirent `state:"nosave"`
+	// +checklocks:dirMu
+	direntsOK bool `state:"nosave"`
+	// +checklocks:dirMu
+	direntsMtime int64 `state:"nosave"`
+
+	// dirVersion counts changes to the directory's entries made through this
+	// filesystem, which drop the listing.
+	//
+	// +checklocks:dirMu
+	dirVersion uint64 `state:"nosave"`
 }
 
 func (i *inode) Mode() linux.FileMode {
@@ -598,12 +621,19 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 	}
 
 	fd.LockFD.Init(&i.locks)
-	// FOPEN_KEEP_CACHE is the default flag for noOpen.
+	isDir := i.filemode().IsDir()
+	// The defaults when no open request is sent, as Linux's fuse_file_open():
+	// keep the page cache and, for directories, cache the listing.
 	fd.OpenFlag = linux.FOPEN_KEEP_CACHE
+	if isDir {
+		fd.OpenFlag |= linux.FOPEN_CACHE_DIR
+	}
 
 	// An open request is sent unless the file handle was already returned by
-	// FUSE_CREATE, or the server does not support open for regular files.
-	willSendOpen := !i.fh.new && (!i.fs.conn.noOpen || i.filemode().IsDir())
+	// FUSE_CREATE, or the server does not support open (or opendir).
+	willSendOpen := !i.fh.new && ((!isDir && !i.fs.conn.noOpen) || (isDir && !i.fs.conn.noOpenDir.Load()))
+	// Without a server handle there is nothing to release.
+	fd.noRelease = !i.fh.new && !willSendOpen
 
 	truncateRegFile := opts.Flags&linux.O_TRUNC != 0 && i.filemode().FileType() == linux.S_IFREG
 	if truncateRegFile && !(willSendOpen && i.fs.conn.atomicOTrunc) {
@@ -631,8 +661,15 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 
 		out := linux.FUSEOpenOut{}
 		if err := i.call(ctx, opcode, &in, &out); err != nil {
-			if linuxerr.Equals(linuxerr.ENOSYS, err) && !i.filemode().IsDir() {
+			switch {
+			case linuxerr.Equals(linuxerr.ENOSYS, err) && isDir:
+				// As Linux, opendir of a server that doesn't implement it
+				// succeeds and is never sent again (FUSE_NO_OPENDIR_SUPPORT).
+				i.fs.conn.noOpenDir.Store(true)
+				fd.noRelease = true
+			case linuxerr.Equals(linuxerr.ENOSYS, err):
 				i.fs.conn.noOpen = true
+				fd.noRelease = true
 				// The open that was to carry O_TRUNC was refused; truncate with SETATTR.
 				if truncateRegFile && i.fs.conn.atomicOTrunc {
 					opts := vfs.SetStatOptions{Stat: linux.Statx{Size: 0, Mask: linux.STATX_SIZE}}
@@ -640,7 +677,7 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentr
 						return nil, err
 					}
 				}
-			} else {
+			default:
 				return nil, err
 			}
 		} else {
@@ -742,6 +779,7 @@ func (*inode) IterDirents(ctx context.Context, mnt *vfs.Mount, callback vfs.Iter
 
 // NewFile implements kernfs.Inode.NewFile.
 func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) (kernfs.Inode, error) {
+	defer i.dirChanged()
 	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC |
 		linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NONBLOCK | linux.O_NOCTTY
 	if !i.fs.conn.noCreate {
@@ -773,6 +811,7 @@ func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) 
 
 // NewNode implements kernfs.Inode.NewNode.
 func (i *inode) NewNode(ctx context.Context, name string, opts vfs.MknodOptions) (kernfs.Inode, error) {
+	defer i.dirChanged()
 	in := linux.FUSEMknodIn{
 		MknodMeta: linux.FUSEMknodMeta{
 			Mode:  uint32(opts.Mode),
@@ -786,6 +825,7 @@ func (i *inode) NewNode(ctx context.Context, name string, opts vfs.MknodOptions)
 
 // NewSymlink implements kernfs.Inode.NewSymlink.
 func (i *inode) NewSymlink(ctx context.Context, name, target string) (kernfs.Inode, error) {
+	defer i.dirChanged()
 	in := linux.FUSESymlinkIn{
 		Name:   linux.CString(name),
 		Target: linux.CString(target),
@@ -795,6 +835,7 @@ func (i *inode) NewSymlink(ctx context.Context, name, target string) (kernfs.Ino
 
 // NewLink implements kernfs.Inode.NewLink.
 func (i *inode) NewLink(ctx context.Context, name string, target kernfs.Inode) (kernfs.Inode, error) {
+	defer i.dirChanged()
 	targetInode := target.(*inode)
 	in := linux.FUSELinkIn{
 		OldNodeID: primitive.Uint64(targetInode.nodeID),
@@ -805,12 +846,14 @@ func (i *inode) NewLink(ctx context.Context, name string, target kernfs.Inode) (
 
 // Unlink implements kernfs.Inode.Unlink.
 func (i *inode) Unlink(ctx context.Context, name string, child kernfs.Inode) error {
+	defer i.dirChanged()
 	in := linux.FUSEUnlinkIn{Name: linux.CString(name)}
 	return i.callNoReply(ctx, linux.FUSE_UNLINK, &in)
 }
 
 // NewDir implements kernfs.Inode.NewDir.
 func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (kernfs.Inode, error) {
+	defer i.dirChanged()
 	in := linux.FUSEMkdirIn{
 		MkdirMeta: linux.FUSEMkdirMeta{
 			Mode:  uint32(opts.Mode),
@@ -823,6 +866,7 @@ func (i *inode) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) 
 
 // RmDir implements kernfs.Inode.RmDir.
 func (i *inode) RmDir(ctx context.Context, name string, child kernfs.Inode) error {
+	defer i.dirChanged()
 	in := linux.FUSERmDirIn{Name: linux.CString(name)}
 	return i.callNoReply(ctx, linux.FUSE_RMDIR, &in)
 }
@@ -830,6 +874,8 @@ func (i *inode) RmDir(ctx context.Context, name string, child kernfs.Inode) erro
 // Rename implements kernfs.Inode.Rename.
 func (i *inode) Rename(ctx context.Context, oldname, newname string, child, dstDir kernfs.Inode) error {
 	dstDirInode := dstDir.(*inode)
+	defer i.dirChanged()
+	defer dstDirInode.dirChanged()
 	in := linux.FUSERenameIn{
 		Newdir:  primitive.Uint64(dstDirInode.nodeID),
 		Oldname: linux.CString(oldname),

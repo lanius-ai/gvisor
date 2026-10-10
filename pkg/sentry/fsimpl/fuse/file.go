@@ -46,6 +46,10 @@ type fileDescription struct {
 	// OpenFlag is the flag returned by open.
 	OpenFlag uint32
 
+	// noRelease is true if the server returned no handle to release: no open
+	// request was sent, or the server doesn't implement open (or opendir).
+	noRelease bool
+
 	// off is the file offset.
 	off atomicbitops.Int64
 }
@@ -70,7 +74,7 @@ func (fd *fileDescription) statusFlags() uint32 {
 func (fd *fileDescription) Release(ctx context.Context) {
 	// no need to release if FUSE server doesn't implement Open.
 	fs := fd.inode().fs
-	if fs.conn.noOpen {
+	if fd.noRelease {
 		return
 	}
 
